@@ -46,18 +46,48 @@ def resource_path(rel):
     return os.path.join(base, rel)
 
 
-def find_voice_model(models_dir):
-    """Return (model_path, config_path) for the first .onnx in models_dir."""
+# Piper voice names use "<lang>_<region>-<voice>[-<quality>]".
+LANG_LABELS = {
+    "en_US": "English (US)",
+    "en_GB": "English (UK)",
+    "zh_CN": "Chinese (Mandarin)",
+    "es_ES": "Spanish (Spain)",
+    "es_MX": "Spanish (Mexico)",
+    "fr_FR": "French (France)",
+    "de_DE": "German (Germany)",
+    "it_IT": "Italian (Italy)",
+    "pt_PT": "Portuguese (Portugal)",
+    "pt_BR": "Portuguese (Brazil)",
+    "ja_JP": "Japanese",
+    "ko_KR": "Korean",
+    "ru_RU": "Russian",
+}
+
+
+def voice_display_name(model_name):
+    """Turn 'en_US-lessac-medium' into 'English (US) — lessac medium'."""
+    stem = os.path.splitext(model_name)[0]
+    parts = stem.split("-", 1)
+    lang = parts[0] if parts else stem
+    rest = parts[1].replace("-", " ") if len(parts) > 1 else ""
+    label = LANG_LABELS.get(lang, lang.replace("_", " "))
+    return f"{label} — {rest}".strip(" —")
+
+
+def list_voice_models(models_dir):
+    """Return [(model_path, config_path, display_name), ...] sorted by name."""
     if not os.path.isdir(models_dir):
-        return None, None
+        return []
+    result = []
     for name in sorted(os.listdir(models_dir)):
-        if name.endswith(".onnx"):
-            model = os.path.join(models_dir, name)
-            config = model + ".json"
-            if not os.path.exists(config):
-                config = None
-            return model, config
-    return None, None
+        if not name.endswith(".onnx"):
+            continue
+        model = os.path.join(models_dir, name)
+        config = model + ".json"
+        if not os.path.exists(config):
+            config = None
+        result.append((model, config, voice_display_name(name)))
+    return result
 
 
 def fmt_duration(seconds):
@@ -169,9 +199,15 @@ class MainWindow(QMainWindow):
         for book in self.db.list_books():
             pos = fmt_duration(book["position"])
             total = fmt_duration(book["total_duration"])
+            voice = (
+                f"voice: {voice_display_name(book['voice_model'])}"
+                if book.get("voice_model")
+                else ""
+            )
             text = (
                 f"{book['title']}  ({book['author'] or 'unknown author'})\n"
                 f"{book['chapter_count']} chunks  |  listened {pos} / {total}"
+                + (f"\n{voice}" if voice else "")
             )
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, book["id"])
@@ -223,15 +259,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Busy", "A conversion is already running.")
             return
 
-        model_path, config_path = find_voice_model(MODELS_DIR)
-        if not model_path:
+        models = list_voice_models(MODELS_DIR)
+        if not models:
             QMessageBox.warning(
                 self,
                 "Voice model missing",
                 "No Piper voice model found in:\n"
                 f"{MODELS_DIR}\n\n"
                 "Run:  python scripts/download_models.py\n"
-                "to download the default Chinese voice, then try again.",
+                "to download voices, then try again.",
             )
             return
 
@@ -253,6 +289,15 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
+        names = [entry[2] for entry in models]
+        choice, ok = QInputDialog.getItem(
+            self, "Choose voice", "Voice model:", names, 0, False
+        )
+        if not ok:
+            return
+        model_path, config_path, _ = next(e for e in models if e[2] == choice)
+        voice_model = os.path.splitext(os.path.basename(model_path))[0]
+
         self.worker = ConvertWorker(
             pdf_path,
             BOOKS_DIR,
@@ -261,6 +306,7 @@ class MainWindow(QMainWindow):
             config_path,
             title.strip() or default_title,
             author.strip(),
+            voice_model,
             self,
         )
         self.worker.progress.connect(self._on_progress)

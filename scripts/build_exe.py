@@ -27,6 +27,8 @@ def main():
         "--add-data",
         os.path.join(ROOT, "assets") + os.pathsep + "assets",
         "--collect-all",
+        "pymupdf",
+        "--collect-all",
         "piper",
         "--collect-all",
         "piper_phonemize",

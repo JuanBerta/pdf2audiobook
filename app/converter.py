@@ -134,7 +134,16 @@ def sanitize(name):
     return cleaned or "book"
 
 
-def convert_pdf(pdf_path, out_dir, db, tts, title=None, author="", progress_cb=None):
+def convert_pdf(
+    pdf_path,
+    out_dir,
+    db,
+    tts,
+    title=None,
+    author="",
+    voice_model="",
+    progress_cb=None,
+):
     """Extract text, synthesize each chunk and register the result in the library.
 
     Returns the new book id. Raises RuntimeError if no readable text is found.
@@ -142,7 +151,9 @@ def convert_pdf(pdf_path, out_dir, db, tts, title=None, author="", progress_cb=N
     if title is None:
         title = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    book_id = db.add_book(title, author=author, source_pdf=pdf_path)
+    book_id = db.add_book(
+        title, author=author, source_pdf=pdf_path, voice_model=voice_model
+    )
     pages = extract_pages(pdf_path)
     chunks = chunk_text(pages)
     if not chunks:

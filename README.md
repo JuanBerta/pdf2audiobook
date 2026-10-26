@@ -36,8 +36,10 @@ Everything runs **offline and locally** - no accounts, no cloud uploads.
 ```bash
 pip install -r requirements.txt
 
-# Download a voice model (Chinese by default):
+# Download one or more voice models (Chinese by default):
 python scripts/download_models.py
+python scripts/download_models.py --voice en_US-lessac-medium
+python scripts/download_models.py --voice es_ES-davefx-medium
 
 # Optional: generate the app icon
 python scripts/make_icon.py
@@ -53,13 +55,19 @@ Available voices - see `scripts/download_models.py`:
 - English: `en_US-lessac-medium`, `en_US-amy-medium`, `en_GB-alba-medium`
 - Spanish: `es_ES-davefx-medium`, `es_MX-claude-high`
 
+Each model is ~60 MB; download as many as you like. Every model present in
+the models folder shows up in the conversion dialog, where you pick which
+voice will narrate the audiobook. The chosen voice is saved with the book
+and shown in the library.
+
 ## Usage
 
 1. Click **Convert PDF to audiobook** and pick a PDF
 2. Give it a title and (optionally) an author
-3. Wait for the conversion to finish - each paragraph chunk becomes a chapter
-4. Double-click the book in the gallery to start listening
-5. Close and reopen anytime: playback continues where you left off
+3. Choose the voice model for the narration (every downloaded model is listed)
+4. Wait for the conversion to finish - each paragraph chunk becomes a chapter
+5. Double-click the book in the gallery to start listening
+6. Close and reopen anytime: playback continues where you left off
 
 ## Build a standalone .exe
 

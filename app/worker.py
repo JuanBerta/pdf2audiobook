@@ -20,6 +20,7 @@ class ConvertWorker(QThread):
         config_path,
         title,
         author,
+        voice_model="",
         parent=None,
     ):
         super().__init__(parent)
@@ -30,6 +31,7 @@ class ConvertWorker(QThread):
         self.config_path = config_path
         self.title = title
         self.author = author
+        self.voice_model = voice_model
 
     def run(self):
         try:
@@ -45,6 +47,7 @@ class ConvertWorker(QThread):
                 tts,
                 title=self.title,
                 author=self.author,
+                voice_model=self.voice_model,
                 progress_cb=lambda p, m: self.progress.emit(p, m),
             )
             self.succeeded.emit(book_id)

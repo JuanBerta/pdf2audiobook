@@ -25,6 +25,7 @@ class AudiobookDB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     author TEXT NOT NULL DEFAULT '',
+                    voice_model TEXT NOT NULL DEFAULT '',
                     source_pdf TEXT NOT NULL DEFAULT '',
                     cover_path TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
@@ -44,13 +45,19 @@ class AudiobookDB:
                 );
                 """
             )
+            # Migration: older libraries lack the voice_model column.
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(books)")]
+            if "voice_model" not in cols:
+                conn.execute(
+                    "ALTER TABLE books ADD COLUMN voice_model TEXT NOT NULL DEFAULT ''"
+                )
 
-    def add_book(self, title, author="", source_pdf="", cover_path=""):
+    def add_book(self, title, author="", source_pdf="", cover_path="", voice_model=""):
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO books (title, author, source_pdf, cover_path) "
-                "VALUES (?, ?, ?, ?)",
-                (title, author, source_pdf, cover_path),
+                "INSERT INTO books (title, author, source_pdf, cover_path, voice_model) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (title, author, source_pdf, cover_path, voice_model),
             )
             return cur.lastrowid
 
