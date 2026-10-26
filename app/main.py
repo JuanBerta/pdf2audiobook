@@ -8,7 +8,8 @@ Main window provides:
 import os
 import sys
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .database import AudiobookDB
+from .i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, get_language, set_language, tr
 from .player import AudioPlayer
 from .worker import ConvertWorker
 
@@ -114,6 +116,7 @@ class MainWindow(QMainWindow):
         self.current_chapter_idx = -1
         self._slider_guard = False
 
+        self._build_menu()
         self._build_ui()
         self._reload_books()
 
@@ -129,15 +132,50 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(self._save_progress)
 
     # ------------------------------------------------------------------ UI
+    def _build_menu(self):
+        menubar = self.menuBar()
+        self.lang_menu = menubar.addMenu(tr("menu_language"))
+        self._lang_actions = {}
+        for code in SUPPORTED_LANGUAGES:
+            act = QAction(LANGUAGE_NAMES[code], self, checkable=True)
+            act.setChecked(code == get_language())
+            act.triggered.connect(
+                lambda checked, c=code: self._switch_language(c)
+            )
+            self.lang_menu.addAction(act)
+            self._lang_actions[code] = act
+
+    def _switch_language(self, code):
+        if code == get_language():
+            return
+        set_language(code)
+        QSettings("PDF2Audiobook", "PDF2Audiobook").setValue(
+            "ui/language", code
+        )
+        for c, act in self._lang_actions.items():
+            act.setChecked(c == code)
+        self._apply_ui_texts()
+        self._reload_books()
+        self._update_now_label()
+
+    def _apply_ui_texts(self):
+        self.lang_menu.setTitle(tr("menu_language"))
+        self.btn_convert.setText(tr("convert_btn"))
+        self.btn_open_dir.setText(tr("open_dir_btn"))
+        self.btn_play.setText(tr("play"))
+        self.btn_stop.setText(tr("stop"))
+        if self.current_chapter_idx < 0:
+            self.now_label.setText(tr("nothing_playing"))
+
     def _build_ui(self):
         central = QWidget(self)
         root = QVBoxLayout(central)
 
         # Top bar
         top = QHBoxLayout()
-        self.btn_convert = QPushButton("Convert PDF to audiobook")
+        self.btn_convert = QPushButton(tr("convert_btn"))
         self.btn_convert.clicked.connect(self._start_conversion)
-        self.btn_open_dir = QPushButton("Open library folder")
+        self.btn_open_dir = QPushButton(tr("open_dir_btn"))
         self.btn_open_dir.clicked.connect(self._open_library_dir)
         top.addWidget(self.btn_convert)
         top.addWidget(self.btn_open_dir)
@@ -166,16 +204,16 @@ class MainWindow(QMainWindow):
         root.addLayout(middle, 1)
 
         # Now-playing label
-        self.now_label = QLabel("Nothing playing")
+        self.now_label = QLabel(tr("nothing_playing"))
         root.addWidget(self.now_label)
 
         # Player bar
         bar = QHBoxLayout()
         self.btn_prev = QPushButton("|<")
         self.btn_prev.clicked.connect(lambda: self._skip(-1))
-        self.btn_play = QPushButton("Play")
+        self.btn_play = QPushButton(tr("play"))
         self.btn_play.clicked.connect(self._toggle_play)
-        self.btn_stop = QPushButton("Stop")
+        self.btn_stop = QPushButton(tr("stop"))
         self.btn_stop.clicked.connect(self._stop_playback)
         self.btn_next = QPushButton(">|")
         self.btn_next.clicked.connect(lambda: self._skip(1))
@@ -199,14 +237,16 @@ class MainWindow(QMainWindow):
         for book in self.db.list_books():
             pos = fmt_duration(book["position"])
             total = fmt_duration(book["total_duration"])
+            author = book["author"] or tr("unknown_author")
             voice = (
-                f"voice: {voice_display_name(book['voice_model'])}"
+                tr("voice_label", voice=voice_display_name(book["voice_model"]))
                 if book.get("voice_model")
                 else ""
             )
             text = (
-                f"{book['title']}  ({book['author'] or 'unknown author'})\n"
-                f"{book['chapter_count']} chunks  |  listened {pos} / {total}"
+                f"{book['title']}  ({author})\n"
+                f"{tr('chunks', count=book['chapter_count'])}  |  "
+                f"{tr('listened_progress', pos=pos, total=total)}"
                 + (f"\n{voice}" if voice else "")
             )
             item = QListWidgetItem(text)
@@ -221,20 +261,23 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        action = menu.addAction("Delete from library")
+        action = menu.addAction(tr("delete_from_library"))
         chosen = menu.exec(self.book_list.mapToGlobal(pos))
         if chosen is action:
             book_id = item.data(Qt.ItemDataRole.UserRole)
             self._delete_book(book_id)
 
     def _delete_book(self, book_id):
-        answer = QMessageBox.question(
+        box = QMessageBox(
+            QMessageBox.Icon.Question,
+            tr("delete_book_title"),
+            tr("delete_book_msg"),
             self,
-            "Delete book",
-            "Remove this audiobook from the library? (audio files are kept on disk)",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        yes_btn = box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
+        box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
+        box.exec()
+        if box.clickedButton() is not yes_btn:
             return
         if self.current_book and self.current_book["id"] == book_id:
             self._stop_playback()
@@ -256,42 +299,39 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- conversion
     def _start_conversion(self):
         if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(self, "Busy", "A conversion is already running.")
+            QMessageBox.information(self, tr("busy_title"), tr("busy_msg"))
             return
 
         models = list_voice_models(MODELS_DIR)
         if not models:
             QMessageBox.warning(
                 self,
-                "Voice model missing",
-                "No Piper voice model found in:\n"
-                f"{MODELS_DIR}\n\n"
-                "Run:  python scripts/download_models.py\n"
-                "to download voices, then try again.",
+                tr("model_missing_title"),
+                tr("model_missing_msg", dir=MODELS_DIR),
             )
             return
 
         pdf_path, _ = QFileDialog.getOpenFileName(
-            self, "Select PDF", "", "PDF files (*.pdf)"
+            self, tr("select_pdf"), "", f"{tr('pdf_files')} (*.pdf)"
         )
         if not pdf_path:
             return
 
         default_title = os.path.splitext(os.path.basename(pdf_path))[0]
         title, ok = QInputDialog.getText(
-            self, "Book title", "Title:", QLineEdit.EchoMode.Normal, default_title
+            self, tr("book_title_dlg"), tr("title_label"), QLineEdit.EchoMode.Normal, default_title
         )
         if not ok:
             return
         author, ok = QInputDialog.getText(
-            self, "Author (optional)", "Author:", QLineEdit.EchoMode.Normal, ""
+            self, tr("author_dlg"), tr("author_label"), QLineEdit.EchoMode.Normal, ""
         )
         if not ok:
             return
 
         names = [entry[2] for entry in models]
         choice, ok = QInputDialog.getItem(
-            self, "Choose voice", "Voice model:", names, 0, False
+            self, tr("choose_voice_dlg"), tr("voice_model_label"), names, 0, False
         )
         if not ok:
             return
@@ -315,7 +355,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_label.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Extracting PDF text...")
+        self.progress_label.setText(tr("extracting"))
         self.worker.start()
 
     def _on_progress(self, percent, message):
@@ -327,13 +367,13 @@ class MainWindow(QMainWindow):
         self.progress_label.setVisible(False)
         self._reload_books()
         QMessageBox.information(
-            self, "Conversion finished", f"Audiobook saved to your library (id {book_id})."
+            self, tr("done_title"), tr("done_msg", book_id=book_id)
         )
 
     def _on_convert_failed(self, message):
         self.progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
-        QMessageBox.critical(self, "Conversion failed", message)
+        QMessageBox.critical(self, tr("failed_title"), message)
 
     # ---------------------------------------------------------- playback
     def _play_selected(self):
@@ -363,7 +403,7 @@ class MainWindow(QMainWindow):
         try:
             self.player.play(ch["audio_path"], position=position)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Playback error", str(exc))
+            QMessageBox.warning(self, tr("playback_error_title"), str(exc))
             return
         self._save_timer.start()
         self._update_now_label()
@@ -383,7 +423,7 @@ class MainWindow(QMainWindow):
     def _stop_playback(self):
         self.player.stop()
         self._save_timer.stop()
-        self.now_label.setText("Nothing playing")
+        self.now_label.setText(tr("nothing_playing"))
         self.slider.setValue(0)
         self.time_label.setText("00:00 / 00:00")
 
@@ -435,11 +475,18 @@ class MainWindow(QMainWindow):
         if self.current_chapter_idx < 0 or self.current_book is None:
             return
         ch = self.current_chapters[self.current_chapter_idx]
-        state = "playing" if self.player.is_playing else "paused"
-        self.now_label.setText(
-            f"{self.current_book['title']} - {ch['title']} ({state})"
+        state = (
+            tr("state_playing") if self.player.is_playing else tr("state_paused")
         )
-        self.btn_play.setText("Pause" if self.player.is_playing else "Play")
+        self.now_label.setText(
+            tr(
+                "now_playing",
+                title=self.current_book["title"],
+                chapter=ch["title"],
+                state=state,
+            )
+        )
+        self.btn_play.setText(tr("pause") if self.player.is_playing else tr("play"))
 
     def closeEvent(self, event):
         self._save_progress()
@@ -456,6 +503,11 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("PDF2Audiobook")
     app.setApplicationDisplayName("PDF2Audiobook")
+    stored = QSettings("PDF2Audiobook", "PDF2Audiobook").value(
+        "ui/language", "en"
+    )
+    if stored in SUPPORTED_LANGUAGES:
+        set_language(stored)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

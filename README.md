@@ -18,6 +18,7 @@ Everything runs **offline and locally** - no accounts, no cloud uploads.
 - Chapter-based playback with resume (remembers where you stopped)
 - Local neural text-to-speech (Piper, runs entirely on your machine)
 - Multiple voice models supported (Chinese, English, Spanish, ...)
+- UI language selection (English / Español / 中文)
 - Packaged as a standalone Windows executable
 
 ## Tech stack
@@ -68,6 +69,8 @@ and shown in the library.
 4. Wait for the conversion to finish - each paragraph chunk becomes a chapter
 5. Double-click the book in the gallery to start listening
 6. Close and reopen anytime: playback continues where you left off
+7. Switch the interface language from the **Language** menu (English, Español
+   or 中文) - the choice is remembered for next launch
 
 ## Build a standalone .exe
 
@@ -89,6 +92,7 @@ app/
   main.py        # PyQt6 desktop app (gallery + player + conversion)
   converter.py   # PDF extraction, chunking, Piper synthesis
   database.py    # SQLite library
+  i18n.py        # UI localization (en / es / zh)
   player.py      # pygame playback
   worker.py      # background conversion thread
 run.py           # application entry point

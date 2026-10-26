@@ -4,6 +4,7 @@ import os
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .converter import PiperTTS, convert_pdf
+from .i18n import tr
 
 
 class ConvertWorker(QThread):
@@ -39,7 +40,7 @@ class ConvertWorker(QThread):
 
             db = AudiobookDB(self.db_path)
             tts = PiperTTS(self.model_path, self.config_path)
-            self.progress.emit(0, "Extracting PDF text...")
+            self.progress.emit(0, tr("extracting"))
             book_id = convert_pdf(
                 self.pdf_path,
                 self.out_dir,

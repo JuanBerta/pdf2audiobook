@@ -1,4 +1,5 @@
 """PDF text extraction, chunking and Piper TTS synthesis."""
+from .i18n import tr
 import os
 import re
 import wave
@@ -27,14 +28,9 @@ class PiperTTS:
         try:
             from piper import PiperVoice
         except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "piper-tts is not installed. Run: pip install piper-tts"
-            ) from exc
+            raise RuntimeError(tr("piper_not_installed")) from exc
         if not os.path.exists(self.model_path):
-            raise RuntimeError(
-                f"Voice model not found: {self.model_path}\n"
-                "Download one with scripts/download_models.py"
-            )
+            raise RuntimeError(tr("model_not_found", path=self.model_path))
         try:
             self.voice = PiperVoice.load(
                 self.model_path, config_path=self.config_path
@@ -157,10 +153,7 @@ def convert_pdf(
     pages = extract_pages(pdf_path)
     chunks = chunk_text(pages)
     if not chunks:
-        raise RuntimeError(
-            "No readable text found in the PDF. "
-            "Scanned/image-only PDFs require OCR, which is not supported yet."
-        )
+        raise RuntimeError(tr("no_text_error"))
 
     book_dir = os.path.join(out_dir, f"{book_id:04d}_{sanitize(title)}")
     os.makedirs(book_dir, exist_ok=True)
@@ -170,7 +163,10 @@ def convert_pdf(
     total_duration = 0.0
     for i, chunk in enumerate(chunks):
         if progress_cb:
-            progress_cb(int((i / total) * 100), f"Synthesizing chunk {i + 1}/{total}...")
+            progress_cb(
+            int((i / total) * 100),
+            tr("synth_chunk", current=i + 1, total=total),
+        )
         out_path = os.path.join(book_dir, f"ch_{i + 1:04d}.wav")
         tts.synthesize_to_file(chunk, out_path)
         dur = audio_duration(out_path)
@@ -179,5 +175,5 @@ def convert_pdf(
 
     db.finalize_book(book_id, total, total_duration)
     if progress_cb:
-        progress_cb(100, "Done")
+        progress_cb(100, tr("done"))
     return book_id
