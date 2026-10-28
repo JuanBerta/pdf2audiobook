@@ -11,6 +11,7 @@ dist/
 *.spec
 build_log.txt
 ver.txt
+PDF2Audiobook-*.zip
 
 # Local app data (library, converted audio, downloaded voice models)
 # NOTE: keep these out of the repository; they are user data.

@@ -1,70 +1,56 @@
-"""Audio playback via pygame."""
+"""Audio playback using the sounddevice time-stretch backend."""
 import os
-import time
 
-import pygame
+from .audio_backend import SoundDevicePlayer
 
 
 class AudioPlayer:
-    """Wraps pygame.mixer.music for chapter playback with seek support."""
+    """Wraps SoundDevicePlayer for chapter playback with seek and speed."""
 
     def __init__(self):
-        if not pygame.mixer.get_init():
-            try:
-                pygame.mixer.init()
-            except pygame.error:
-                # Fall back without audio device (e.g. CI / headless runs).
-                pass
         self.current_path = None
-        self._base_pos = 0.0
-        self._start_time = 0.0
-        self._paused_at = 0.0
-        self._paused = False
-        self._audio_ok = pygame.mixer.get_init() is not None
+        self._backend = SoundDevicePlayer()
 
     def play(self, path, position=0.0):
-        if not self._audio_ok:
-            raise RuntimeError("No audio device available")
-        pygame.mixer.music.stop()
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-        pygame.mixer.music.load(path)
-        pygame.mixer.music.play(start=position)
+        self._backend.play(path, position=position)
         self.current_path = path
-        self._base_pos = position
-        self._start_time = time.time()
-        self._paused = False
-        self._paused_at = 0.0
 
     def pause(self):
-        if self._paused or not self._audio_ok:
+        if not self.is_playing:
             return
-        if pygame.mixer.music.get_busy():
-            self._paused_at = self.position
-            pygame.mixer.music.pause()
-            self._paused = True
+        self._backend.pause()
 
     def resume(self):
-        if not self._paused or not self._audio_ok:
+        if not self.is_paused:
             return
-        pygame.mixer.music.unpause()
-        self._start_time = time.time()
-        self._paused = False
+        self._backend.resume()
 
     def stop(self):
-        if self._audio_ok:
-            pygame.mixer.music.stop()
+        self._backend.stop()
         self.current_path = None
-        self._paused = False
+
+    @property
+    def is_paused(self):
+        return self._backend._paused  # noqa: SLF001 - thin facade
 
     @property
     def is_playing(self):
-        return self._audio_ok and bool(pygame.mixer.music.get_busy())
+        return (
+            self.current_path is not None
+            and self._backend.is_active
+            and not self._backend._paused  # noqa: SLF001
+            and not self._backend._finished  # noqa: SLF001
+        )
 
     @property
     def position(self):
-        if self._paused:
-            return self._paused_at
-        if self.current_path is None or not self._audio_ok:
-            return 0.0
-        return self._base_pos + (time.time() - self._start_time)
+        return self._backend.position
+
+    @property
+    def rate(self):
+        return self._backend.rate
+
+    def set_rate(self, rate):
+        self._backend.set_rate(rate)

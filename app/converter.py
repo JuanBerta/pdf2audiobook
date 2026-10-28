@@ -10,6 +10,10 @@ except ImportError:  # pragma: no cover - older versions
     import fitz  # type: ignore[no-redef]
 
 
+class CancelledError(Exception):
+    """Raised when the conversion queue is cancelled mid-job."""
+
+
 class PiperTTS:
     """Thin wrapper around piper-tts, tolerant of API differences."""
 
@@ -38,17 +42,18 @@ class PiperTTS:
         except TypeError:  # older piper-tts API
             self.voice = PiperVoice(self.model_path, config_path=self.config_path)
 
-    def synthesize_to_file(self, text, out_path):
+    def synthesize_to_file(self, text, out_path, length_scale=1.0):
         self.load()
+        kwargs = {"length_scale": length_scale}
         if hasattr(self.voice, "synthesize_wav"):
             # piper-tts >= 1.3 expects a wave.Wave_write object
             import wave
 
             with wave.open(out_path, "wb") as w:
-                self.voice.synthesize_wav(text, w)
+                self.voice.synthesize_wav(text, w, **kwargs)
         else:  # older piper-tts API writes bytes to a binary file
             with open(out_path, "wb") as f:
-                self.voice.synthesize(text, f)
+                self.voice.synthesize(text, f, **kwargs)
         return out_path
 
 
@@ -59,6 +64,23 @@ def extract_pages(pdf_path):
         return [page.get_text("text") for page in doc]
     finally:
         doc.close()
+
+
+def first_page_cover(pdf_path, out_dir):
+    """Render the first page as a small PNG cover, or None on failure."""
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if doc.page_count == 0:
+                return None
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+        finally:
+            doc.close()
+        cover_path = os.path.join(out_dir, "cover.png")
+        pix.save(cover_path)
+        return cover_path
+    except Exception:  # noqa: BLE001 - cover is a best-effort nicety
+        return None
 
 
 def clean_text(text):
@@ -138,38 +160,65 @@ def convert_pdf(
     title=None,
     author="",
     voice_model="",
+    length_scale=1.0,
     progress_cb=None,
+    cancel_event=None,
+    pause_event=None,
 ):
     """Extract text, synthesize each chunk and register the result in the library.
 
-    Returns the new book id. Raises RuntimeError if no readable text is found.
+    Supports variable speech speed (length_scale), cooperative cancel/pause
+    events, and resuming an unfinished book that was left behind by an
+    earlier cancelled or crashed conversion of the same PDF.
+
+    Returns the new (or resumed) book id.
     """
     if title is None:
         title = os.path.splitext(os.path.basename(pdf_path))[0]
 
-    book_id = db.add_book(
-        title, author=author, source_pdf=pdf_path, voice_model=voice_model
-    )
     pages = extract_pages(pdf_path)
     chunks = chunk_text(pages)
     if not chunks:
         raise RuntimeError(tr("no_text_error"))
 
+    unfinished = db.find_incomplete_book(pdf_path, title)
+    if unfinished is not None:
+        book_id = unfinished["id"]
+        db.clear_chapters(book_id)
+    else:
+        book_id = db.add_book(
+            title,
+            author=author,
+            source_pdf=pdf_path,
+            voice_model=voice_model,
+            rate=length_scale,
+        )
     book_dir = os.path.join(out_dir, f"{book_id:04d}_{sanitize(title)}")
     os.makedirs(book_dir, exist_ok=True)
-    tts.load()
 
+    cover = first_page_cover(pdf_path, book_dir)
+    if cover:
+        db.set_cover(book_id, cover)
+
+    tts.load()
     total = len(chunks)
     total_duration = 0.0
     for i, chunk in enumerate(chunks):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+        if pause_event is not None:
+            pause_event.wait()
         if progress_cb:
             progress_cb(
-            int((i / total) * 100),
-            tr("synth_chunk", current=i + 1, total=total),
-        )
+                int((i / total) * 100),
+                tr("synth_chunk", current=i + 1, total=total),
+            )
         out_path = os.path.join(book_dir, f"ch_{i + 1:04d}.wav")
-        tts.synthesize_to_file(chunk, out_path)
-        dur = audio_duration(out_path)
+        if os.path.exists(out_path):
+            dur = audio_duration(out_path)
+        else:
+            tts.synthesize_to_file(chunk, out_path, length_scale=length_scale)
+            dur = audio_duration(out_path)
         total_duration += dur
         db.add_chapter(book_id, i, f"Chunk {i + 1}", out_path, dur)
 
