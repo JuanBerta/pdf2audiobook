@@ -44,16 +44,33 @@ class PiperTTS:
 
     def synthesize_to_file(self, text, out_path, length_scale=1.0):
         self.load()
-        kwargs = {"length_scale": length_scale}
         if hasattr(self.voice, "synthesize_wav"):
-            # piper-tts >= 1.3 expects a wave.Wave_write object
+            # piper-tts >= 1.3 expects a wave.Wave_write object and carries
+            # voice parameters in a SynthesisConfig; older builds accepted
+            # length_scale as a plain keyword argument instead.
             import wave
 
+            try:
+                from piper.config import SynthesisConfig
+            except Exception:  # pragma: no cover - very old piper
+                SynthesisConfig = None  # type: ignore[assignment]
             with wave.open(out_path, "wb") as w:
-                self.voice.synthesize_wav(text, w, **kwargs)
+                if SynthesisConfig is not None:
+                    try:
+                        self.voice.synthesize_wav(
+                            text,
+                            w,
+                            syn_config=SynthesisConfig(
+                                length_scale=length_scale
+                            ),
+                        )
+                        return out_path
+                    except TypeError:
+                        pass  # fall through to the legacy keyword API
+                self.voice.synthesize_wav(text, w, length_scale=length_scale)
         else:  # older piper-tts API writes bytes to a binary file
             with open(out_path, "wb") as f:
-                self.voice.synthesize(text, f, **kwargs)
+                self.voice.synthesize(text, f, length_scale=length_scale)
         return out_path
 
 
@@ -106,6 +123,9 @@ def chunk_text(pages, max_chars=2500):
     lines, so consecutive non-empty lines are re-joined into paragraphs
     before chunking. Returns a list of strings suitable for TTS.
     """
+    # Guard against a non-positive limit: a zero/negative max_chars would
+    # make the hard-split loop below spin forever on non-empty paragraphs.
+    max_chars = max(1, int(max_chars))
     paragraphs: list[str] = []
     for page in pages:
         lines = clean_text(page).splitlines()
@@ -200,7 +220,15 @@ def _locate_sentence(spans_cache, sentence, start_page=0):
     needle = _norm_text(sentence)
     if not needle:
         return None, None
-    for page_idx in range(start_page, len(spans_cache)):
+    # A monotonic start_page cursor is a bad idea: sentences inside one
+    # chunk can legitimately live on an earlier page than the previous
+    # chunk's last sentence (page-number-only pages, boxed sidebars,
+    # extraction reordering). Searching forward from start_page only would
+    # silently miss them, so if the forward pass fails we fall back to a
+    # full scan from the first page.
+    for page_idx in list(range(start_page, len(spans_cache))) + list(
+        range(0, min(start_page, len(spans_cache)))
+    ):
         haystack, spans = spans_cache[page_idx]
         idx = haystack.find(needle)
         if idx < 0:
@@ -255,10 +283,22 @@ def convert_pdf(
     if title is None:
         title = os.path.splitext(os.path.basename(pdf_path))[0]
 
+    # The extraction / alignment-preparation stages used to run with no
+    # progress callback at all, leaving the UI stuck on "Extrayendo texto
+    # del PDF..." at 0% until the first chunk is synthesized. Emit a few
+    # early steps so the bar visibly moves even for large PDFs and slow
+    # model loads.
+    def _emit(percent, message):
+        if progress_cb:
+            progress_cb(percent, message)
+
+    _emit(1, tr("extracting"))
     pages = extract_pages(pdf_path)
+    _emit(3, tr("extracting"))
     chunks = chunk_text(pages)
     if not chunks:
         raise RuntimeError(tr("no_text_error"))
+    _emit(4, tr("extracting"))
 
     unfinished = db.find_incomplete_book(pdf_path, title)
     if unfinished is not None:
@@ -279,6 +319,7 @@ def convert_pdf(
     cover = first_page_cover(pdf_path, book_dir)
     if cover:
         db.set_cover(book_id, cover)
+    _emit(5, tr("extracting"))
 
     # Per-page span cache used to locate each sentence (page + bbox).
     doc = fitz.open(pdf_path)
@@ -286,8 +327,10 @@ def convert_pdf(
         spans_cache = [_build_page_spans(page) for page in doc]
     finally:
         doc.close()
+    _emit(6, tr("extracting"))
 
     tts.load()
+    _emit(8, tr("extracting"))
     total = len(chunks)
     total_duration = 0.0
     chapter_offset = 0.0
@@ -298,8 +341,10 @@ def convert_pdf(
         if pause_event is not None:
             pause_event.wait()
         if progress_cb:
+            # 8% accounts for extraction/alignment prep above; synthesis
+            # then fills the remaining 92% monotonically up to 100%.
             progress_cb(
-                int((i / total) * 100),
+                int(8 + (i / total) * 92),
                 tr("synth_chunk", current=i + 1, total=total),
             )
         out_path = os.path.join(book_dir, f"ch_{i + 1:04d}.wav")

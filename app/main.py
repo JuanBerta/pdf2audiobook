@@ -49,7 +49,7 @@ from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -485,6 +485,20 @@ class MainWindow(QMainWindow):
         self._apply_book_filter(self.search_box.text())
         self._update_statusbar()
 
+    def _cover_font(self, point_size):
+        """Build a cover font with a guaranteed positive point size.
+
+        Qt reports pointSize() == -1 when the size was not explicitly set
+        (or the family cannot be resolved), and any size <= 0 makes
+        QPainter log ``QFont::setPointSize: Point size <= 0`` on every
+        cover render. Apply a positive fallback so drawing never hits that
+        warning.
+        """
+        font = QFont("Segoe UI", point_size)
+        if font.pointSize() <= 0:
+            font.setPointSize(10 if point_size >= 10 else 9)
+        return font
+
     def _book_cover(self, book):
         """Cover pixmap: real cover image if present, else a colored spine."""
         cover = book.get("cover_path")
@@ -517,14 +531,15 @@ class MainWindow(QMainWindow):
         title = book["title"] or "?"
         painter.setPen(QColor("#ffffff"))
         first = title[:2] or "?"
-        font = QFont("Segoe UI", 30, QFont.Weight.Bold)
+        font = self._cover_font(30)
+        font.setBold(True)
         painter.setFont(font)
         painter.drawText(
             QRect(6, 44, 98, 64),
             Qt.AlignmentFlag.AlignCenter,
             first,
         )
-        font = QFont("Segoe UI", 9)
+        font = self._cover_font(9)
         painter.setFont(font)
         painter.drawText(
             QRect(6, 106, 98, 40),
