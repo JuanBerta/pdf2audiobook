@@ -96,6 +96,12 @@ TRANSLATIONS = {
             "Voice model not found: {path}\n"
             "Download one with scripts/download_models.py"
         ),
+        "readalong_toggle": "Read PDF",
+        "readalong_no_data": (
+            "No read-along data for this book. Re-convert its PDF to enable "
+            "synchronized reading."
+        ),
+        "readalong_page": "Page {page}",
     },
     "es": {
         "convert_btn": "Convertir PDF a audiolibro",
@@ -177,6 +183,12 @@ TRANSLATIONS = {
             "No se encontró el modelo de voz: {path}\n"
             "Descargue uno con scripts/download_models.py"
         ),
+        "readalong_toggle": "Leer PDF",
+        "readalong_no_data": (
+            "Este libro no tiene datos de lectura sincronizada. "
+            "Vuelva a convertir su PDF para activarla."
+        ),
+        "readalong_page": "Página {page}",
     },
     "zh": {
         "convert_btn": "将 PDF 转换为有声书",
@@ -252,6 +264,9 @@ TRANSLATIONS = {
         "no_text_error": "在 PDF 中未找到可读文本。扫描版（纯图片）PDF 需要 OCR 支持，暂不支持。",
         "piper_not_installed": "未安装 piper-tts。请运行：pip install piper-tts",
         "model_not_found": "未找到语音模型：{path}\n请使用 scripts/download_models.py 下载一个。",
+        "readalong_toggle": "阅读 PDF",
+        "readalong_no_data": "本书暂无听读同步数据，请重新转换其 PDF 以启用。",
+        "readalong_page": "第 {page} 页",
     },
 }
 

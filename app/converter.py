@@ -138,6 +138,85 @@ def chunk_text(pages, max_chars=2500):
     return chunks
 
 
+# ---------------------------------------------------------------------
+# Read-along: sentence splitting + PDF text/bbox locating.
+# ---------------------------------------------------------------------
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？…])\s+")
+
+
+def split_sentences(text):
+    """Split cleaned paragraph text into sentences, keeping the terminator.
+
+    A tiny guard merges back very short trailing pieces that are usually
+    abbreviations (e.g. "Mr.", "e.g.") instead of sentence boundaries.
+    """
+    parts = _SENT_SPLIT_RE.split(text.strip())
+    out = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if out and len(part) <= 3 and not part[0].isupper():
+            out[-1] = f"{out[-1]} {part}"
+        else:
+            out.append(part)
+    return out
+
+
+def _norm_text(text):
+    """Remove all whitespace so layout artifacts do not break matching."""
+    return re.sub(r"\s+", "", text)
+
+
+def _build_page_spans(page):
+    """Return (haystack, spans) for locating sentences on one PDF page.
+
+    ``haystack`` concatenates every text span with whitespace stripped;
+    ``spans`` maps each span's character range back to its bounding box as
+    ``(start, end, (x0, y0, x1, y1))``.
+    """
+    hay_parts = []
+    spans = []
+    pos = 0
+    data = page.get_text("dict")
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text:
+                    continue
+                hay_parts.append(text)
+                spans.append((pos, pos + len(text), tuple(span["bbox"])))
+                pos += len(text)
+    return "".join(hay_parts), spans
+
+
+def _locate_sentence(spans_cache, sentence, start_page=0):
+    """Locate a sentence inside the cached per-page span maps.
+
+    Returns ``(page_index, (x0, y0, x1, y1))`` or ``(None, None)`` when the
+    sentence cannot be matched (e.g. layout differences from cleaning).
+    """
+    needle = _norm_text(sentence)
+    if not needle:
+        return None, None
+    for page_idx in range(start_page, len(spans_cache)):
+        haystack, spans = spans_cache[page_idx]
+        idx = haystack.find(needle)
+        if idx < 0:
+            continue
+        end = idx + len(needle)
+        covering = [sp for sp in spans if sp[0] < end and sp[1] > idx]
+        if not covering:
+            continue
+        x0 = min(sp[2][0] for sp in covering)
+        y0 = min(sp[2][1] for sp in covering)
+        x1 = max(sp[2][2] for sp in covering)
+        y1 = max(sp[2][3] for sp in covering)
+        return page_idx, (x0, y0, x1, y1)
+    return None, None
+
+
 def audio_duration(path):
     """Duration in seconds of a WAV file."""
     try:
@@ -185,6 +264,7 @@ def convert_pdf(
     if unfinished is not None:
         book_id = unfinished["id"]
         db.clear_chapters(book_id)
+        db.clear_sentence_alignments(book_id)
     else:
         book_id = db.add_book(
             title,
@@ -200,9 +280,18 @@ def convert_pdf(
     if cover:
         db.set_cover(book_id, cover)
 
+    # Per-page span cache used to locate each sentence (page + bbox).
+    doc = fitz.open(pdf_path)
+    try:
+        spans_cache = [_build_page_spans(page) for page in doc]
+    finally:
+        doc.close()
+
     tts.load()
     total = len(chunks)
     total_duration = 0.0
+    chapter_offset = 0.0
+    last_page = 0
     for i, chunk in enumerate(chunks):
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError()
@@ -219,6 +308,36 @@ def convert_pdf(
         else:
             tts.synthesize_to_file(chunk, out_path, length_scale=length_scale)
             dur = audio_duration(out_path)
+
+        # Collect per-sentence alignment for this chunk (read-along).
+        sents = split_sentences(chunk)
+        aligned = []
+        for sent in sents:
+            page_idx, bbox = _locate_sentence(
+                spans_cache, sent, start_page=last_page
+            )
+            if page_idx is not None:
+                last_page = page_idx
+            aligned.append(
+                {
+                    "page_no": (page_idx + 1) if page_idx is not None else 0,
+                    "bbox": bbox,
+                    "text": sent,
+                }
+            )
+        # Distribute the chapter's audio by sentence text length (no
+        # word-level timestamps from Piper); timestamps use the global
+        # audio timeline so variable playback rate stays aligned.
+        total_chars = sum(len(a["text"]) for a in aligned) or 1
+        cursor = chapter_offset
+        for a in aligned:
+            seg = dur * len(a["text"]) / total_chars
+            a["audio_start"] = cursor
+            a["audio_end"] = cursor + seg
+            cursor += seg
+        db.add_sentence_alignments(book_id, i, aligned)
+        chapter_offset += dur
+
         total_duration += dur
         db.add_chapter(book_id, i, f"Chunk {i + 1}", out_path, dur)
 

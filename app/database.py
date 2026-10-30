@@ -1,4 +1,5 @@
 """SQLite storage for the audiobook library."""
+import json
 import os
 import sqlite3
 
@@ -52,6 +53,20 @@ class AudiobookDB:
                     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                     FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS sentence_alignments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id INTEGER NOT NULL,
+                    chapter_idx INTEGER NOT NULL,
+                    sent_idx INTEGER NOT NULL,
+                    page_no INTEGER NOT NULL DEFAULT 0,
+                    bbox TEXT NOT NULL DEFAULT '',
+                    text TEXT NOT NULL DEFAULT '',
+                    audio_start REAL NOT NULL DEFAULT 0,
+                    audio_end REAL NOT NULL DEFAULT 0,
+                    FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_sent_align_book
+                    ON sentence_alignments(book_id, chapter_idx, sent_idx);
                 """
             )
             # Migration: older libraries lack the voice_model column.
@@ -144,6 +159,52 @@ class AudiobookDB:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE books SET cover_path=? WHERE id=?", (cover_path, book_id)
+            )
+
+    # ------------------------------------------------ read-along alignment
+    def add_sentence_alignments(self, book_id, chapter_idx, items):
+        """Persist per-sentence alignment for one chapter.
+
+        Each item is a dict with keys: page_no, bbox (tuple/None), text,
+        audio_start, audio_end. audio_* timestamps live on the global audio
+        timeline (seconds from the start of the book).
+        """
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO sentence_alignments "
+                "(book_id, chapter_idx, sent_idx, page_no, bbox, text, "
+                "audio_start, audio_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        book_id,
+                        chapter_idx,
+                        i,
+                        item.get("page_no", 0),
+                        json.dumps(item.get("bbox")),
+                        item.get("text", ""),
+                        item.get("audio_start", 0.0),
+                        item.get("audio_end", 0.0),
+                    )
+                    for i, item in enumerate(items)
+                ],
+            )
+
+    def get_sentence_alignments(self, book_id):
+        """Return all alignment rows for a book, ordered by chapter/sentence."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sentence_alignments WHERE book_id=? "
+                "ORDER BY chapter_idx ASC, sent_idx ASC",
+                (book_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def clear_sentence_alignments(self, book_id):
+        """Drop stale alignment rows before re-converting a book."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM sentence_alignments WHERE book_id=?",
+                (book_id,),
             )
 
     # ---------------------------------------------------------- bookmarks

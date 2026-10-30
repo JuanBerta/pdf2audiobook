@@ -44,11 +44,12 @@ from PyQt6.QtWidgets import (
 from .database import AudiobookDB
 from .i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, get_language, set_language, tr
 from .player import AudioPlayer
+from .readalong import ReadAlongPanel
 from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -149,6 +150,7 @@ class MainWindow(QMainWindow):
         self.current_book = None
         self.current_chapters = []
         self.current_chapter_idx = -1
+        self._chapter_offsets = []
         self._slider_guard = False
         self.repeat_mode = REPEAT_OFF
         self._book_items = {}
@@ -321,6 +323,8 @@ class MainWindow(QMainWindow):
         self.btn_pause.setText(
             tr("resume_conv") if self._conv_paused else tr("pause_conv")
         )
+        self.btn_readalong.setText(tr("readalong_toggle"))
+        self.btn_readalong.setToolTip(tr("readalong_toggle"))
         if self.current_chapter_idx < 0:
             self.now_label.setText(tr("nothing_playing"))
         self._update_statusbar()
@@ -384,9 +388,16 @@ class MainWindow(QMainWindow):
         middle.addWidget(self.chapter_list, 2)
         root.addLayout(middle, 1)
 
-        # Now-playing label
+        # Now-playing label + read-along toggle
+        now_row = QHBoxLayout()
         self.now_label = QLabel(tr("nothing_playing"))
-        root.addWidget(self.now_label)
+        self.btn_readalong = QPushButton(tr("readalong_toggle"))
+        self.btn_readalong.setCheckable(True)
+        self.btn_readalong.setToolTip(tr("readalong_toggle"))
+        self.btn_readalong.clicked.connect(self._toggle_readalong)
+        now_row.addWidget(self.now_label, 1)
+        now_row.addWidget(self.btn_readalong)
+        root.addLayout(now_row)
 
         # Player bar
         bar = QHBoxLayout()
@@ -435,6 +446,12 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.slider, 1)
         bar.addWidget(self.time_label)
         root.addLayout(bar)
+
+        # Read-along panel (hidden until the user toggles it)
+        self.read_panel = ReadAlongPanel()
+        self.read_panel.setVisible(False)
+        self.read_panel.seek_requested.connect(self._readalong_seek)
+        root.addWidget(self.read_panel)
 
         self.setCentralWidget(central)
 
@@ -573,6 +590,11 @@ class MainWindow(QMainWindow):
     def _load_chapters(self, book):
         self.current_book = book
         self.current_chapters = self.db.get_chapters(book["id"])
+        self._chapter_offsets = []
+        acc = 0.0
+        for ch in self.current_chapters:
+            self._chapter_offsets.append(acc)
+            acc += ch["duration"]
         self.chapter_list.clear()
         for ch in self.current_chapters:
             item = QListWidgetItem(
@@ -580,6 +602,7 @@ class MainWindow(QMainWindow):
             )
             item.setData(Qt.ItemDataRole.UserRole, ch["idx"])
             self.chapter_list.addItem(item)
+        self._load_readalong()
 
     # --------------------------------------------------------- conversion
     def _start_conversion(self):
@@ -739,6 +762,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, tr("playback_error_title"), str(exc))
             return
+        self.read_panel.set_chapter(idx)
         self._save_timer.start()
         self._highlight_active_book()
         self._update_now_label()
@@ -763,6 +787,51 @@ class MainWindow(QMainWindow):
         else:
             self._play_chapter(self.current_chapter_idx)
         self._update_now_label()
+
+    # ------------------------------------------------------ read-along sync
+    def _toggle_readalong(self):
+        show = not self.read_panel.isVisible()
+        self.read_panel.setVisible(show)
+        self.btn_readalong.setChecked(show)
+        if show:
+            self._load_readalong()
+            self._sync_readalong()
+
+    def _load_readalong(self):
+        if self.current_book is None:
+            self.read_panel.set_book(None, [], self._chapter_offsets)
+            return
+        alignments = self.db.get_sentence_alignments(self.current_book["id"])
+        self.read_panel.set_book(
+            self.current_book.get("source_pdf"), alignments, self._chapter_offsets
+        )
+
+    def _sync_readalong(self):
+        if not hasattr(self, "read_panel") or not self.read_panel.isVisible():
+            return
+        if self.current_chapter_idx < 0 or self.current_book is None:
+            return
+        if not self.player.is_playing:
+            # Paused/stopped: never scroll or highlight while not playing.
+            return
+        offset = (
+            self._chapter_offsets[self.current_chapter_idx]
+            if self.current_chapter_idx < len(self._chapter_offsets)
+            else 0.0
+        )
+        self.read_panel.set_playback_time(offset + self.player.position)
+
+    def _readalong_seek(self, audio_start):
+        """Jump audio to a sentence clicked in the read-along panel."""
+        if self.current_chapter_idx < 0:
+            return
+        offset = (
+            self._chapter_offsets[self.current_chapter_idx]
+            if self.current_chapter_idx < len(self._chapter_offsets)
+            else 0.0
+        )
+        target = max(0.0, audio_start - offset)
+        self._play_chapter(self.current_chapter_idx, target)
 
     def _stop_playback(self):
         self.player.stop()
@@ -873,6 +942,7 @@ class MainWindow(QMainWindow):
             self.slider.setValue(int((pos / ch["duration"]) * 1000))
             self._slider_guard = False
         self.time_label.setText(f"{fmt_duration(pos)} / {fmt_duration(ch['duration'])}")
+        self._sync_readalong()
         # Auto-advance when a chapter finishes (never while paused).
         if (
             not self.player.is_playing
