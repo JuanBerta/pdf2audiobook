@@ -49,7 +49,7 @@ from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -574,6 +574,7 @@ class MainWindow(QMainWindow):
             QMessageBox.Icon.Question,
             tr("delete_book_title"),
             tr("delete_book_msg"),
+            QMessageBox.StandardButton.NoButton,
             self,
         )
         yes_btn = box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
