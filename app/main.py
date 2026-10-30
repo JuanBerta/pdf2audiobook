@@ -48,7 +48,7 @@ from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -423,6 +423,8 @@ class MainWindow(QMainWindow):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
         self.slider.sliderMoved.connect(self._seek)
+        self.slider.sliderPressed.connect(self._slider_pressed)
+        self.slider.sliderReleased.connect(self._slider_released)
         self.time_label = QLabel("00:00 / 00:00")
         bar.addWidget(self.btn_prev)
         bar.addWidget(self.btn_play)
@@ -848,6 +850,18 @@ class MainWindow(QMainWindow):
             return
         target = (value / 1000.0) * ch["duration"]
         self._play_chapter(self.current_chapter_idx, target)
+
+    def _slider_pressed(self):
+        # User grabbed the handle or clicked the track: pause ticker sync so
+        # the 500 ms UI timer cannot overwrite the slider before release.
+        self._slider_guard = True
+
+    def _slider_released(self):
+        # Fired for both dragging (after sliderMoved) and a plain track click.
+        # On a plain click the slider jumps to the clicked value without any
+        # sliderMoved emission, so seeking on release covers that case.
+        self._slider_guard = False
+        self._seek(self.slider.value())
 
     def _tick(self):
         if self.current_chapter_idx < 0 or self.current_book is None:
