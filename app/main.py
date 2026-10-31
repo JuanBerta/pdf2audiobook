@@ -8,6 +8,7 @@ Main window provides:
 import logging
 import os
 import sys
+import webbrowser
 
 from PyQt6.QtCore import QLockFile, QRect, QSettings, QSize, Qt, QTimer
 from PyQt6.QtGui import (
@@ -41,15 +42,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .browser_pdf import ReadAlongServer
 from .database import AudiobookDB
 from .i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, get_language, set_language, tr
 from .player import AudioPlayer
-from .readalong import ReadAlongPanel
 from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -154,6 +155,7 @@ class MainWindow(QMainWindow):
         self._slider_guard = False
         self.repeat_mode = REPEAT_OFF
         self._book_items = {}
+        self._read_server = None
 
         self.settings = QSettings("PDF2Audiobook", "PDF2Audiobook")
         self._theme_mode = str(self.settings.value("ui/theme", "dark") or "dark")
@@ -266,6 +268,7 @@ class MainWindow(QMainWindow):
         for m, act in self._theme_actions.items():
             act.setChecked(m == mode)
         apply_theme(QApplication.instance(), mode)
+        self._update_repeat_button()
 
     def _set_sleep_timer(self, minutes):
         for m, act in self._sleep_actions.items():
@@ -388,13 +391,13 @@ class MainWindow(QMainWindow):
         middle.addWidget(self.chapter_list, 2)
         root.addLayout(middle, 1)
 
-        # Now-playing label + read-along toggle
+        # Now-playing label + Read PDF (opens the source PDF in the system
+        # browser, served locally with read-along sync).
         now_row = QHBoxLayout()
         self.now_label = QLabel(tr("nothing_playing"))
         self.btn_readalong = QPushButton(tr("readalong_toggle"))
-        self.btn_readalong.setCheckable(True)
         self.btn_readalong.setToolTip(tr("readalong_toggle"))
-        self.btn_readalong.clicked.connect(self._toggle_readalong)
+        self.btn_readalong.clicked.connect(self._open_read_pdf)
         now_row.addWidget(self.now_label, 1)
         now_row.addWidget(self.btn_readalong)
         root.addLayout(now_row)
@@ -447,12 +450,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.time_label)
         root.addLayout(bar)
 
-        # Read-along panel (hidden until the user toggles it)
-        self.read_panel = ReadAlongPanel()
-        self.read_panel.setVisible(False)
-        self.read_panel.seek_requested.connect(self._readalong_seek)
-        root.addWidget(self.read_panel)
-
         self.setCentralWidget(central)
 
     # ------------------------------------------------------------- library
@@ -492,16 +489,21 @@ class MainWindow(QMainWindow):
         (or the family cannot be resolved), and any size <= 0 makes
         QPainter log ``QFont::setPointSize: Point size <= 0`` on every
         cover render. Apply a positive fallback so drawing never hits that
-        warning.
+        warning. The fallback loop re-validates *after* each setPointSize
+        (some Qt versions defer the effective size until the family is
+        resolved, so a single probe can still read -1), and the last
+        resort switches to setPixelSize, which bypasses point metrics
+        entirely and can never trigger the warning.
         """
         size = point_size if point_size and point_size > 0 else 10
         font = QFont("Segoe UI", size)
-        # Re-apply the size unconditionally: some Qt versions defer the
-        # effective size until the family is resolved, and probing
-        # pointSize() right after construction can still return -1 there.
-        font.setPointSize(size)
-        if font.pointSize() <= 0:
-            font.setPointSize(9 if size < 10 else 10)
+        for candidate in (size, 10, 9):
+            font.setPointSize(candidate)
+            if font.pointSize() > 0:
+                return font
+        # Family could not be resolved to a point size at all; use pixel
+        # size so QPainter never receives a non-positive point size.
+        font.setPixelSize(max(12, int(size * 1.2)))
         return font
 
     def _book_cover(self, book):
@@ -623,7 +625,6 @@ class MainWindow(QMainWindow):
             )
             item.setData(Qt.ItemDataRole.UserRole, ch["idx"])
             self.chapter_list.addItem(item)
-        self._load_readalong()
 
     # --------------------------------------------------------- conversion
     def _start_conversion(self):
@@ -797,7 +798,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, tr("playback_error_title"), str(exc))
             return
-        self.read_panel.set_chapter(idx)
         self._save_timer.start()
         self._highlight_active_book()
         self._update_now_label()
@@ -823,41 +823,58 @@ class MainWindow(QMainWindow):
             self._play_chapter(self.current_chapter_idx)
         self._update_now_label()
 
-    # ------------------------------------------------------ read-along sync
-    def _toggle_readalong(self):
-        show = not self.read_panel.isVisible()
-        self.read_panel.setVisible(show)
-        self.btn_readalong.setChecked(show)
-        if show:
-            self._load_readalong()
-            self._sync_readalong()
+    # ------------------------------------------------------ read PDF (browser)
+    def _open_read_pdf(self):
+        """Open the current book's source PDF in the system browser.
 
-    def _load_readalong(self):
+        A local HTTP server (browser_pdf.ReadAlongServer) serves the PDF,
+        the sentence-alignment data and a tiny playback-state snapshot.
+        The browser page renders the PDF with PDF.js and keeps
+        auto-scroll / word-highlight / click-to-seek in sync.
+        """
         if self.current_book is None:
-            self.read_panel.set_book(None, [], self._chapter_offsets)
+            QMessageBox.information(
+                self, tr("readalong_toggle"), tr("readalong_no_data")
+            )
             return
         alignments = self.db.get_sentence_alignments(self.current_book["id"])
-        self.read_panel.set_book(
-            self.current_book.get("source_pdf"), alignments, self._chapter_offsets
+        if self._read_server is None:
+            server = ReadAlongServer()
+            server.set_seek_callback(self._readalong_seek)
+            server.start()
+            self._read_server = server
+        self._read_server.set_book(
+            self.current_book.get("source_pdf"),
+            alignments,
+            self._chapter_offsets,
+            get_language(),
         )
+        url = self._read_server.url
+        if url:
+            webbrowser.open(url)
+        self._sync_readalong()
 
     def _sync_readalong(self):
-        if not hasattr(self, "read_panel") or not self.read_panel.isVisible():
+        """Push the current playback position to the browser page."""
+        if self._read_server is None:
             return
         if self.current_chapter_idx < 0 or self.current_book is None:
-            return
-        if not self.player.is_playing:
-            # Paused/stopped: never scroll or highlight while not playing.
+            self._read_server.update_state(-1, 0.0, False, self.player.rate)
             return
         offset = (
             self._chapter_offsets[self.current_chapter_idx]
             if self.current_chapter_idx < len(self._chapter_offsets)
             else 0.0
         )
-        self.read_panel.set_playback_time(offset + self.player.position)
+        self._read_server.update_state(
+            self.current_chapter_idx,
+            offset + self.player.position,
+            self.player.is_playing,
+            self.player.rate,
+        )
 
     def _readalong_seek(self, audio_start):
-        """Jump audio to a sentence clicked in the read-along panel."""
+        """Jump audio to a sentence clicked in the browser page."""
         if self.current_chapter_idx < 0:
             return
         offset = (
@@ -882,6 +899,10 @@ class MainWindow(QMainWindow):
 
     def _update_repeat_button(self):
         icon_name = REPEAT_ICON_FILES[self.repeat_mode]
+        if self.repeat_mode == REPEAT_ONE and self._theme_mode == "light":
+            # repeat_one_light uses a dark "1" so it stays visible on light
+            # backgrounds; the dark-theme icon uses a white "1".
+            icon_name = "repeat_one_light.png"
         self.btn_repeat.setIcon(
             QIcon(resource_path(os.path.join("assets", icon_name)))
         )
@@ -1027,6 +1048,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_progress()
         self.player.stop()
+        if self._read_server is not None:
+            self._read_server.shutdown()
         super().closeEvent(event)
 
     # -------------------------------------------------------------- misc

@@ -102,7 +102,12 @@ class SoundDevicePlayer:
                 pass
 
     def _output_sr(self):
-        return int(round(self._sr * self._rate))
+        # Keep the output sample rate fixed at the source rate. The playback
+        # rate is applied purely in the callback by consuming `rate` input
+        # frames per output frame; scaling the stream's sample rate here as
+        # well would cancel the speed change (rate * (1/rate) == 1) and made
+        # the speed buttons / Ctrl+Up/Down a no-op.
+        return int(self._sr)
 
     def _restart_stream(self):
         stream = self._stream
@@ -139,7 +144,7 @@ class SoundDevicePlayer:
             sr = self._sr
             rate = self._rate
             cursor = self._cursor
-        step = 1.0 / rate
+        step = rate
         idx = cursor + step * np.arange(frames, dtype=np.float64)
         n = len(data)
         if idx[0] >= n:

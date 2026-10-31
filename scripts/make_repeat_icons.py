@@ -52,7 +52,7 @@ def draw_repeat(size=SIZE, color=ACCENT):
     return img
 
 
-def draw_repeat_one(size=SIZE, color=ACCENT):
+def draw_repeat_one(size=SIZE, color=ACCENT, number_color=None):
     img = draw_repeat(size, color)
     d = ImageDraw.Draw(img)
     try:
@@ -67,7 +67,7 @@ def draw_repeat_one(size=SIZE, color=ACCENT):
         (size / 2 - tw / 2 - bbox[0], size / 2 - th / 2 - bbox[1]),
         text,
         font=font,
-        fill=DARK,
+        fill=number_color if number_color is not None else (255, 255, 255, 255),
     )
     return img
 
@@ -83,8 +83,14 @@ def grayscale_rgba(img):
 def main():
     os.makedirs(ASSETS, exist_ok=True)
     targets = {
+        # repeat_one.png uses a WHITE "1" so it stays visible on the dark
+        # theme (the old deep-blue glyph blended into the dark button
+        # background). The light theme keeps the high-contrast deep-blue
+        # glyph in repeat_one_light.png; MainWindow picks the file by
+        # current theme.
         "repeat_all.png": draw_repeat(),
         "repeat_one.png": draw_repeat_one(),
+        "repeat_one_light.png": draw_repeat_one(number_color=DARK),
         "repeat_off.png": grayscale_rgba(draw_repeat()),
     }
     for name, img in targets.items():

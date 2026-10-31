@@ -2,6 +2,7 @@
 from .i18n import tr
 import os
 import re
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
 
@@ -43,7 +44,7 @@ class PiperTTS:
         except TypeError:  # older piper-tts API
             self.voice = PiperVoice(self.model_path, config_path=self.config_path)
 
-    def synthesize_to_file(self, text, out_path, length_scale=1.0):
+    def synthesize_to_file(self, text, out_path, length_scale=1.0, cancel_event=None):
         self.load()
         # A hung synthesis (e.g. model/CPU stall) used to freeze the UI at
         # 8% forever because the worker only reports after the call
@@ -87,19 +88,27 @@ class PiperTTS:
 
         # Run in a worker thread so an unresponsive native call cannot
         # freeze the pipeline forever; 10 minutes is far beyond any real
-        # chunk but still gives us a way out of a deadlock.
+        # chunk but still gives us a way out of a deadlock. Poll in small
+        # increments so an explicit cancel is honored while a chunk is
+        # still wedged inside the native synthesis call.
         executor = ThreadPoolExecutor(max_workers=1)
         try:
             fut = executor.submit(_run)
-            try:
-                return fut.result(timeout=600)
-            except _TimeoutError:
-                # The worker thread is still alive but wedged; drop the
-                # voice so a retry starts from a clean model load.
-                self.voice = None
-                raise RuntimeError(
-                    tr("synth_timeout")
-                ) from None
+            deadline = time.monotonic() + 600
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # The worker thread is still alive but wedged; drop the
+                    # voice so a retry starts from a clean model load.
+                    self.voice = None
+                    raise RuntimeError(tr("synth_timeout"))
+                try:
+                    return fut.result(timeout=min(0.5, remaining))
+                except _TimeoutError:
+                    if cancel_event is not None and cancel_event.is_set():
+                        self.voice = None
+                        raise CancelledError() from None
+                    continue
         finally:
             # Never leak the watchdog thread; the runner stops once the
             # call finishes (or is abandoned).
@@ -385,7 +394,16 @@ def convert_pdf(
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError()
         if pause_event is not None:
-            pause_event.wait()
+            # Pause/resume uses a threading.Event as a latch: set() while
+            # paused, clear() on resume. A bare wait() would block forever
+            # while *unpaused* (Event.wait blocks until the flag is set),
+            # which froze the worker at the first chunk (progress stuck at
+            # 8%) and made Cancel unresponsive. Poll instead so both pause
+            # and cancel are honored between chunks.
+            while pause_event.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError()
+                pause_event.wait(timeout=0.2)
         if progress_cb:
             # 8% accounts for extraction/alignment prep above; synthesis
             # then fills the remaining 92% monotonically up to 100%.
@@ -405,17 +423,23 @@ def convert_pdf(
                 except OSError:
                     pass
                 tts.synthesize_to_file(
-                    chunk, out_path, length_scale=length_scale
+                    chunk, out_path, length_scale=length_scale,
+                    cancel_event=cancel_event,
                 )
                 dur = audio_duration(out_path)
         else:
-            tts.synthesize_to_file(chunk, out_path, length_scale=length_scale)
+            tts.synthesize_to_file(
+                chunk, out_path, length_scale=length_scale,
+                cancel_event=cancel_event,
+            )
             dur = audio_duration(out_path)
 
         # Collect per-sentence alignment for this chunk (read-along).
         sents = split_sentences(chunk)
         aligned = []
         for sent in sents:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError()
             page_idx, bbox = _locate_sentence(
                 spans_cache, sent, start_page=last_page
             )
