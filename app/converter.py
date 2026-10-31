@@ -3,6 +3,7 @@ from .i18n import tr
 import os
 import re
 import wave
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
 
 try:  # PyMuPDF >= 1.24 exposes the modern namespace
     import pymupdf as fitz
@@ -44,34 +45,74 @@ class PiperTTS:
 
     def synthesize_to_file(self, text, out_path, length_scale=1.0):
         self.load()
-        if hasattr(self.voice, "synthesize_wav"):
-            # piper-tts >= 1.3 expects a wave.Wave_write object and carries
-            # voice parameters in a SynthesisConfig; older builds accepted
-            # length_scale as a plain keyword argument instead.
-            import wave
+        # A hung synthesis (e.g. model/CPU stall) used to freeze the UI at
+        # 8% forever because the worker only reports after the call
+        # returns. Wrap the actual synthesis in a watchdog: on timeout we
+        # raise a clear error (so the UI reports a failure instead of
+        # appearing stuck) and drop the voice so the next job reloads it.
+        def _run():
+            if hasattr(self.voice, "synthesize_wav"):
+                # piper-tts >= 1.3 expects a wave.Wave_write object and
+                # carries voice parameters in a SynthesisConfig; older
+                # builds accepted length_scale as a plain keyword argument
+                # instead.
+                import wave
 
+                try:
+                    from piper.config import SynthesisConfig
+                except Exception:  # pragma: no cover - very old piper
+                    SynthesisConfig = None  # type: ignore[assignment]
+                with wave.open(out_path, "wb") as w:
+                    if SynthesisConfig is not None:
+                        try:
+                            self.voice.synthesize_wav(
+                                text,
+                                w,
+                                syn_config=SynthesisConfig(
+                                    length_scale=length_scale
+                                ),
+                            )
+                            return out_path
+                        except TypeError:
+                            pass  # fall through to the legacy keyword API
+                    self.voice.synthesize_wav(
+                        text, w, length_scale=length_scale
+                    )
+            else:  # older piper-tts API writes bytes to a binary file
+                with open(out_path, "wb") as f:
+                    self.voice.synthesize(
+                        text, f, length_scale=length_scale
+                    )
+            return out_path
+
+        # Run in a worker thread so an unresponsive native call cannot
+        # freeze the pipeline forever; 10 minutes is far beyond any real
+        # chunk but still gives us a way out of a deadlock.
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = executor.submit(_run)
             try:
-                from piper.config import SynthesisConfig
-            except Exception:  # pragma: no cover - very old piper
-                SynthesisConfig = None  # type: ignore[assignment]
-            with wave.open(out_path, "wb") as w:
-                if SynthesisConfig is not None:
-                    try:
-                        self.voice.synthesize_wav(
-                            text,
-                            w,
-                            syn_config=SynthesisConfig(
-                                length_scale=length_scale
-                            ),
-                        )
-                        return out_path
-                    except TypeError:
-                        pass  # fall through to the legacy keyword API
-                self.voice.synthesize_wav(text, w, length_scale=length_scale)
-        else:  # older piper-tts API writes bytes to a binary file
-            with open(out_path, "wb") as f:
-                self.voice.synthesize(text, f, length_scale=length_scale)
-        return out_path
+                return fut.result(timeout=600)
+            except _TimeoutError:
+                # The worker thread is still alive but wedged; drop the
+                # voice so a retry starts from a clean model load.
+                self.voice = None
+                raise RuntimeError(
+                    tr("synth_timeout")
+                ) from None
+        finally:
+            # Never leak the watchdog thread; the runner stops once the
+            # call finishes (or is abandoned).
+            executor.shutdown(wait=False)
+            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                # A timed-out/aborted synthesis can leave a zero-byte WAV
+                # behind. Remove it so a resume pass does not mistake it
+                # for a finished chunk.
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError:
+                    pass
 
 
 def extract_pages(pdf_path):
@@ -329,6 +370,11 @@ def convert_pdf(
         doc.close()
     _emit(6, tr("extracting"))
 
+    # Model loading can take several seconds (and can fail outright when
+    # piper is broken/missing inside a packaged build); report it as its
+    # own step so a stall is visible instead of being hidden behind the
+    # generic "extracting" message at 8%.
+    _emit(7, tr("loading_model"))
     tts.load()
     _emit(8, tr("extracting"))
     total = len(chunks)
@@ -350,6 +396,18 @@ def convert_pdf(
         out_path = os.path.join(book_dir, f"ch_{i + 1:04d}.wav")
         if os.path.exists(out_path):
             dur = audio_duration(out_path)
+            if dur <= 0:
+                # Zero-byte / truncated WAV left by an aborted synthesis:
+                # treat it as missing and re-synthesize instead of letting
+                # a corrupt chunk silently enter the finished book.
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                tts.synthesize_to_file(
+                    chunk, out_path, length_scale=length_scale
+                )
+                dur = audio_duration(out_path)
         else:
             tts.synthesize_to_file(chunk, out_path, length_scale=length_scale)
             dur = audio_duration(out_path)

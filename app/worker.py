@@ -73,12 +73,27 @@ class QueueWorker(QThread):
         with self._lock:
             jobs = list(self._jobs)
         total = len(jobs)
-        db = AudiobookDB(self._db_path)
+
+        # Database/tts setup used to happen outside the per-job guard: if
+        # opening the library or constructing the TTS wrapper failed, the
+        # thread died silently and the UI froze forever at the last
+        # progress value. Route those failures through job_failed as well.
+        try:
+            db = AudiobookDB(self._db_path)
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            for job in jobs:
+                self.job_failed.emit(str(exc), job["title"])
+            self.all_done.emit()
+            return
 
         for i, job in enumerate(jobs):
             if self._cancel_event.is_set():
                 break
-            tts = PiperTTS(job["model_path"], job["config_path"])
+            try:
+                tts = PiperTTS(job["model_path"], job["config_path"])
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                self.job_failed.emit(str(exc), job["title"])
+                continue
             base = (i / total) * 100 if total else 0.0
 
             def cb(percent, message, _base=base, _total=total):

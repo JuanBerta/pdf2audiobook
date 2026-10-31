@@ -49,7 +49,7 @@ from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -494,9 +494,14 @@ class MainWindow(QMainWindow):
         cover render. Apply a positive fallback so drawing never hits that
         warning.
         """
-        font = QFont("Segoe UI", point_size)
+        size = point_size if point_size and point_size > 0 else 10
+        font = QFont("Segoe UI", size)
+        # Re-apply the size unconditionally: some Qt versions defer the
+        # effective size until the family is resolved, and probing
+        # pointSize() right after construction can still return -1 there.
+        font.setPointSize(size)
         if font.pointSize() <= 0:
-            font.setPointSize(10 if point_size >= 10 else 9)
+            font.setPointSize(9 if size < 10 else 10)
         return font
 
     def _book_cover(self, book):
@@ -721,7 +726,21 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, tr("done_title"), tr("done"))
 
     def _on_convert_failed(self, message, title):
+        # A failed job used to only update the label: with the progress bar
+        # still visible the UI looked like a frozen 8%, and the real error
+        # was easy to miss. Surface it as a dialog and restore the controls
+        # so the user knows the conversion actually ended.
         self.progress_label.setText(f"{title}: {message}")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.btn_pause.setVisible(False)
+        self.btn_cancel.setVisible(False)
+        QMessageBox.warning(
+            self,
+            tr("failed_title"),
+            f"{title}: {message}",
+        )
 
     def _toggle_conv_pause(self):
         if self.worker is None:
