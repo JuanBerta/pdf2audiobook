@@ -82,7 +82,7 @@ class ReadAlongServer:
                 pass
 
     def set_seek_callback(self, cb):
-        """cb(global_audio_seconds) is invoked on the HTTP worker thread."""
+        """cb(global_audio_seconds, chapter_idx=None) on the HTTP worker thread."""
         self._seek_cb = cb
 
     def set_book(self, pdf_path, alignments, chapter_offsets, lang):
@@ -224,13 +224,17 @@ class _Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(length) if length else b"{}"
                 data = json.loads(raw.decode("utf-8") or "{}")
                 audio_start = float(data.get("audio_start", -1.0))
+                chapter_raw = data.get("chapter_idx")
+                chapter_idx = (
+                    int(chapter_raw) if chapter_raw is not None else None
+                )
             except (ValueError, TypeError):
                 self._send(400, {"ok": False, "error": "bad audio_start"})
                 return
             cb = owner._seek_cb
             if cb is not None and audio_start >= 0.0:
                 try:
-                    cb(audio_start)
+                    cb(audio_start, chapter_idx)
                 except Exception:  # noqa: BLE001 - never kill the worker
                     pass
             self._send(200, {"ok": True})

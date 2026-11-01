@@ -21,6 +21,15 @@ class SoundDevicePlayer:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # Serializes all stream lifecycle operations (play/stop/resume/
+        # set_rate/restart). Without it, concurrent play() calls (e.g. rapid
+        # clicks on the browser reader each triggering a seek) can leave
+        # multiple OutputStream objects alive. Because every stream shares the
+        # same _callback (which advances _cursor per call), N live streams make
+        # the audio advance N frames per output frame - i.e. apparent speed
+        # multiplies with every click until the cursor runs past the end and
+        # the output goes silent.
+        self._stream_lock = threading.RLock()
         self._data = None          # (N,) mono or (N, C) float32
         self._sr = 48000
         self._rate = 1.0
@@ -52,54 +61,62 @@ class SoundDevicePlayer:
         rate = float(rate)
         if not MIN_RATE <= rate <= MAX_RATE:
             raise ValueError(f"Rate must be between {MIN_RATE} and {MAX_RATE}")
-        with self._lock:
-            self._rate = rate
+        with self._stream_lock:
+            with self._lock:
+                self._rate = rate
             if self._stream is not None and self._stream.active:
                 self._restart_stream()
 
     def play(self, path, position=0.0):
-        self.stop()
-        data, sr = sf.read(path, dtype="float32", always_2d=False)
-        if data.size == 0:
-            raise ValueError(f"Audio file is empty: {path}")
-        with self._lock:
-            self._data = data
-            self._sr = int(sr)
-            self._cursor = max(0.0, float(position) * sr)
-            self._paused = False
-            self._finished = False
-            self._fade_in_left = int(FADE_SECONDS * self._output_sr())
-            self._fade_out_left = 0
-        self._restart_stream()
+        # Whole lifecycle under _stream_lock so concurrent play() calls (e.g.
+        # rapid reader clicks) are serialized and always end with exactly one
+        # live stream (the last one wins).
+        with self._stream_lock:
+            self.stop()
+            data, sr = sf.read(path, dtype="float32", always_2d=False)
+            if data.size == 0:
+                raise ValueError(f"Audio file is empty: {path}")
+            with self._lock:
+                self._data = data
+                self._sr = int(sr)
+                self._cursor = max(0.0, float(position) * sr)
+                self._paused = False
+                self._finished = False
+                self._fade_in_left = int(FADE_SECONDS * self._output_sr())
+                self._fade_out_left = 0
+            self._restart_stream()
 
     def pause(self):
-        with self._lock:
-            if not self.is_active or self._paused:
-                return
-            self._paused = True
-        self._stream.stop()
+        with self._stream_lock:
+            with self._lock:
+                if not self.is_active or self._paused:
+                    return
+                self._paused = True
+            self._stream.stop()
 
     def resume(self):
-        with self._lock:
-            if not self._paused:
-                return
-            self._paused = False
-            self._fade_in_left = int(FADE_SECONDS * self._output_sr())
+        with self._stream_lock:
+            with self._lock:
+                if not self._paused:
+                    return
+                self._paused = False
+                self._fade_in_left = int(FADE_SECONDS * self._output_sr())
             self._restart_stream()
 
     def stop(self):
-        with self._lock:
-            stream = self._stream
-            self._stream = None
-            self._data = None
-            self._paused = False
-            self._finished = False
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:  # noqa: BLE001 - best effort teardown
-                pass
+        with self._stream_lock:
+            with self._lock:
+                stream = self._stream
+                self._stream = None
+                self._data = None
+                self._paused = False
+                self._finished = False
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:  # noqa: BLE001 - best effort teardown
+                    pass
 
     def _output_sr(self):
         # Keep the output sample rate fixed at the source rate. The playback
@@ -110,6 +127,7 @@ class SoundDevicePlayer:
         return int(self._sr)
 
     def _restart_stream(self):
+        # Must be called while holding _stream_lock.
         stream = self._stream
         self._stream = None
         if stream is not None:
@@ -187,14 +205,17 @@ class SoundDevicePlayer:
     def _schedule_stop(self):
         """Close the stream shortly after the last sample (via timer)."""
         def _close():
-            with self._lock:
-                stream = self._stream
-                self._stream = None
-            if stream is not None and stream.active:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            with self._stream_lock:
+                with self._lock:
+                    stream = self._stream
+                    self._stream = None
+                # Only close if this stream is still the live one; a play()
+                # may have replaced it meanwhile.
+                if stream is not None and stream.active and self._stream is None:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         threading.Timer(0.2, _close).start()

@@ -50,7 +50,7 @@ from .theme import apply_theme
 from .updater import check_for_updates
 from .worker import QueueWorker
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(
@@ -156,6 +156,11 @@ class MainWindow(QMainWindow):
         self.repeat_mode = REPEAT_OFF
         self._book_items = {}
         self._read_server = None
+        # Seeks from the browser reader arrive on HTTP worker threads.
+        # Queue them and drain on the UI tick so playback restarts are
+        # serialized on the main thread (no concurrent play(), no cross-
+        # thread Qt calls) and the last click wins.
+        self._seek_requests = []
 
         self.settings = QSettings("PDF2Audiobook", "PDF2Audiobook")
         self._theme_mode = str(self.settings.value("ui/theme", "dark") or "dark")
@@ -873,17 +878,37 @@ class MainWindow(QMainWindow):
             self.player.rate,
         )
 
-    def _readalong_seek(self, audio_start):
-        """Jump audio to a sentence clicked in the browser page."""
+    def _readalong_seek(self, audio_start, chapter_idx=None):
+        """Queue a browser reader seek; drained on the UI tick.
+
+        Runs on an HTTP worker thread, so it only appends to a thread-safe
+        queue and lets _tick perform the actual playback restart on the main
+        thread. chapter_idx defaults to the currently playing chapter, which
+        keeps old clients (no chapter_idx in the POST body) working.
+        """
         if self.current_chapter_idx < 0:
             return
+        self._seek_requests.append((float(audio_start), chapter_idx))
+
+    def _drain_seek_requests(self):
+        """Apply queued browser seeks (main thread, serialized)."""
+        if not self._seek_requests:
+            return
+        audio_start, chapter_idx = self._seek_requests.pop(0)
+        self._seek_requests.clear()
+        if chapter_idx is None or not (
+            0 <= chapter_idx < len(self.current_chapters)
+        ):
+            chapter_idx = self.current_chapter_idx
+        if chapter_idx < 0:
+            return
         offset = (
-            self._chapter_offsets[self.current_chapter_idx]
-            if self.current_chapter_idx < len(self._chapter_offsets)
+            self._chapter_offsets[chapter_idx]
+            if chapter_idx < len(self._chapter_offsets)
             else 0.0
         )
         target = max(0.0, audio_start - offset)
-        self._play_chapter(self.current_chapter_idx, target)
+        self._play_chapter(chapter_idx, target)
 
     def _stop_playback(self):
         self.player.stop()
@@ -991,6 +1016,7 @@ class MainWindow(QMainWindow):
     def _tick(self):
         if self.current_chapter_idx < 0 or self.current_book is None:
             return
+        self._drain_seek_requests()
         ch = self.current_chapters[self.current_chapter_idx]
         pos = self.player.position
         if ch["duration"] > 0 and not self._slider_guard:

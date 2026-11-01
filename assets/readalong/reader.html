@@ -243,11 +243,15 @@
       div.appendChild(pg);
       div.appendChild(document.createTextNode((s.text || "").replace(/\s+/g, " ").slice(0, 90)));
       div.addEventListener("click", function () {
+        if (seekBusy) return; // rapid double-clicks must not re-seek
+        seekBusy = true;
         fetch("/api/seek", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audio_start: s.audio_start })
-        }).catch(function () {});
+          body: JSON.stringify({ audio_start: s.audio_start, chapter_idx: s.chapter_idx })
+        }).catch(function () {}).finally(function () {
+          setTimeout(function () { seekBusy = false; }, 200);
+        });
       });
       sentList.appendChild(div);
     });
@@ -292,6 +296,8 @@
         statusEl.textContent = state.playing
           ? "● " + fmt(state.global_time) + "  " + state.rate.toFixed(2) + "x"
           : "❚❚ " + fmt(state.global_time);
+        // Drive highlight / auto-scroll / page turn from every state poll.
+        onState();
       }).catch(function () {})
       .finally(function () { setTimeout(poll, 400); });
   }
