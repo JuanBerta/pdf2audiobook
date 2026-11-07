@@ -1,11 +1,11 @@
-"""Audio playback using the sounddevice time-stretch backend."""
+"""Chapter playback facade over the sounddevice backend."""
 import os
 
 from .audio_backend import SoundDevicePlayer
 
 
 class AudioPlayer:
-    """Wraps SoundDevicePlayer for chapter playback with seek and speed."""
+    """Plays one track file at a time with seek, pause and speed."""
 
     def __init__(self):
         self.current_path = None
@@ -17,14 +17,17 @@ class AudioPlayer:
         self._backend.play(path, position=position)
         self.current_path = path
 
+    def play_array(self, data, sample_rate):
+        self._backend.play_array(data, sample_rate)
+        self.current_path = "<memory>"
+
+    def seek(self, position):
+        self._backend.seek(position)
+
     def pause(self):
-        if not self.is_playing:
-            return
         self._backend.pause()
 
     def resume(self):
-        if not self.is_paused:
-            return
         self._backend.resume()
 
     def stop(self):
@@ -32,21 +35,33 @@ class AudioPlayer:
         self.current_path = None
 
     @property
+    def is_loaded(self):
+        return self.current_path is not None and self._backend.is_loaded
+
+    @property
     def is_paused(self):
-        return self._backend._paused  # noqa: SLF001 - thin facade
+        return self._backend.is_paused
+
+    @property
+    def is_finished(self):
+        return self.current_path is not None and self._backend.is_finished
 
     @property
     def is_playing(self):
         return (
             self.current_path is not None
             and self._backend.is_active
-            and not self._backend._paused  # noqa: SLF001
-            and not self._backend._finished  # noqa: SLF001
+            and not self._backend.is_paused
+            and not self._backend.is_finished
         )
 
     @property
     def position(self):
         return self._backend.position
+
+    @property
+    def duration(self):
+        return self._backend.duration
 
     @property
     def rate(self):

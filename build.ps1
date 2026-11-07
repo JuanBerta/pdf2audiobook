@@ -1,44 +1,32 @@
-# Build PDF2Audiobook into a standalone exe and smoke-test it.
+# Build PDF2Audiobook (folder distribution + zip) and smoke-test the exe.
 # Usage:  powershell -ExecutionPolicy Bypass -File build.ps1
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Name = "PDF2Audiobook"
-$Entry = Join-Path $Root "app\main.py"
-$Dist = Join-Path $Root "dist"
-$Exe = Join-Path $Dist "$Name.exe"
+$Exe = Join-Path $Root "dist\$Name\$Name.exe"
+
+Write-Host "==> Running unit tests..."
+python -m pytest -q (Join-Path $Root "tests")
+if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
 
 Write-Host "==> Building $Name with PyInstaller..."
-python -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name $Name `
-    --collect-all pymupdf `
-    --collect-all piper `
-    --collect-all piper_phonemize `
-    --collect-all onnxruntime `
-    --collect-all soundfile `
-    --hidden-import sounddevice `
-    $Entry
-
-if (-not (Test-Path $Exe)) {
-    throw "Build failed: $Exe not found"
+python (Join-Path $Root "scripts\build_exe.py")
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $Exe)) {
+    throw "Build failed: see build\build_log.txt"
 }
-Write-Host "==> Exe produced: $Exe"
 
-# Smoke test 1: the GUI exe must stay alive (no instant crash on startup).
+# Smoke test: the GUI exe must stay alive (no instant crash on startup).
 Write-Host "==> Smoke test: launching $Name for 10 seconds..."
 $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Seconds 10
 if ($proc.HasExited) {
-    throw "Smoke test FAILED: exe exited early with code $($proc.ExitCode)"
+    throw "Smoke test FAILED: exe exited early with code $($proc.ExitCode) (see %LOCALAPPDATA%\PDF2Audiobook\logs\app.log)"
 }
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 Write-Host "==> Smoke test passed (exe stayed alive)."
-
-# Smoke test 2 (manual, needs a real PDF + voice model):
 Write-Host ""
-Write-Host "==> Optional functional smoke test (recommended before release):"
-Write-Host "    Install the app, add a Piper voice model, then convert a real PDF."
-Write-Host "    Verify chapters play, speed buttons (Ctrl+Up/Down) change rate,"
-Write-Host "    and the library survives a restart."
+Write-Host "Recommended manual check before a release: convert a real PDF, play it,"
+Write-Host "change speed (Ctrl+Up/Down), open 'Read PDF', export an M4B and restart the app."
 Write-Host ""
 Write-Host "Build complete: $Exe"

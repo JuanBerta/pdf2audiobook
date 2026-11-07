@@ -169,8 +169,51 @@ QToolTip {{
     border: 1px solid {ACCENT};
     padding: 4px 6px;
 }}
-QMessageBox {{
+QMessageBox, QProgressDialog {{
     background-color: {surface};
+}}
+QComboBox {{
+    background-color: {surface2};
+    border: 1px solid {surface2};
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 22px;
+}}
+QComboBox:focus, QComboBox:hover {{
+    border-color: {ACCENT};
+}}
+QComboBox QAbstractItemView {{
+    background-color: {surface};
+    border: 1px solid {surface2};
+    selection-background-color: {ACCENT_DIM};
+    selection-color: #ffffff;
+}}
+QTableWidget {{
+    background-color: {surface};
+    border: 1px solid {surface2};
+    border-radius: 6px;
+    gridline-color: {surface2};
+    selection-background-color: {ACCENT_DIM};
+    selection-color: #ffffff;
+}}
+QHeaderView::section {{
+    background-color: {surface2};
+    color: {text};
+    border: none;
+    padding: 4px 6px;
+}}
+QCheckBox {{
+    spacing: 8px;
+    padding: 2px 0;
+}}
+QCheckBox:disabled, QLabel:disabled {{
+    color: {muted};
+}}
+QPushButton:disabled {{
+    color: {muted};
+}}
+QPushButton::menu-indicator {{
+    width: 0px;
 }}
 """
 
