@@ -3,9 +3,14 @@ PyQt6>=6.6
 PyMuPDF>=1.24
 piper-tts>=1.2.0
 sounddevice>=0.4.6
-soundfile>=0.12.1
+soundfile>=0.12.1      # bundles libsndfile with MP3 support
 numpy>=1.26
 
-# Tooling / build
+# Optional
+# imageio-ffmpeg       # bundles ffmpeg for "Export as M4B" (or install ffmpeg on PATH)
+# Tesseract OCR        # system install (https://github.com/UB-Mannheim/tesseract/wiki) for scanned PDFs
+
+# Tooling / build / tests
 Pillow>=10.0
 pyinstaller>=6.6
+pytest>=8.0

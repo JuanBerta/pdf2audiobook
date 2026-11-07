@@ -4,14 +4,22 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # Build artifacts
 build/
 dist/
 *.spec
 build_log.txt
+build_*.log
 ver.txt
 PDF2Audiobook-*.zip
+releases/
+
+# Scratch / local test data
+temp/
+temp_*.txt
+_to_delete/
 
 # Local app data (library, converted audio, downloaded voice models)
 # NOTE: keep these out of the repository; they are user data.

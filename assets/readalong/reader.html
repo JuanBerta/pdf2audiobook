@@ -1,358 +1,397 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PDF2Audiobook - Read PDF</title>
+<title>PDF2Audiobook - Read along</title>
 <script src="/pdfjs/pdf.min.js"></script>
 <script>pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.js';</script>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --accent: #2ecc71; --hl: rgba(255, 210, 60, .30);
+          --hl-border: rgba(255, 210, 60, .85); --word: rgba(255, 120, 40, .55); }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; }
-  body {
-    background: #1e1f26; color: #e8e9ed;
-    font-family: "Segoe UI", system-ui, sans-serif;
-    display: flex; flex-direction: column;
-  }
-  header {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 12px; background: #16171c;
-    border-bottom: 1px solid #33343c; flex: 0 0 auto;
-  }
+  body { background: #1e1f26; color: #e8e9ed; font-family: "Segoe UI", system-ui, sans-serif;
+         display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 10px;
+           background: #16171c; border-bottom: 1px solid #33343c; flex: 0 0 auto; }
   header .spacer { flex: 1; }
-  header button {
-    background: #2e86ab; color: #fff; border: none; border-radius: 4px;
-    padding: 6px 12px; font-size: 13px; cursor: pointer;
-  }
-  header button:hover { background: #3a96bc; }
-  header button:disabled { opacity: .45; cursor: default; }
-  #pageInfo { font-size: 13px; color: #a8abb8; }
-  #status { font-size: 12px; color: #7fbf7f; margin-right: 6px; }
+  button, select { background: #32343f; color: #e8e9ed; border: 1px solid #3d3f4b; border-radius: 6px;
+           padding: 5px 10px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: #1f8f52; border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  #pageInfo, #status { font-size: 13px; color: #a8abb8; white-space: nowrap; }
+  #status { min-width: 120px; color: #7fd69c; }
   main { flex: 1 1 auto; display: flex; min-height: 0; }
   #pagePane { flex: 1 1 auto; overflow: auto; position: relative; padding: 12px; }
   #pageWrap { position: relative; margin: 0 auto; width: max-content; }
-  canvas { display: block; box-shadow: 0 0 12px rgba(0,0,0,.55); }
-  .hl { position: absolute; background: rgba(255, 210, 60, .38);
-        border: 1px solid rgba(255, 210, 60, .75); pointer-events: none; }
-  .hl-word { position: absolute; background: rgba(255, 120, 40, .62);
-        pointer-events: none; }
-  .sentence-hover { background: rgba(255,255,255,.06); }
-  #sentPane {
-    flex: 0 0 300px; overflow: auto; padding: 8px;
-    border-left: 1px solid #33343c; background: #1a1b21;
-  }
-  #sentPane h3 { margin: 4px 4px 8px; font-size: 13px; color: #a8abb8;
-        font-weight: 600; }
-  .sent {
-    padding: 6px 8px; margin: 2px 0; border-radius: 4px;
-    font-size: 13px; line-height: 1.4; cursor: pointer;
-    color: #d5d7df; border-left: 3px solid transparent;
-  }
+  canvas { display: block; box-shadow: 0 0 12px rgba(0,0,0,.55); cursor: pointer; }
+  .hl { position: absolute; background: var(--hl); border-bottom: 2px solid var(--hl-border);
+        pointer-events: none; border-radius: 2px; }
+  .hl-word { position: absolute; background: var(--word); pointer-events: none; border-radius: 2px; }
+  #sentPane { flex: 0 0 320px; overflow: auto; padding: 8px; border-left: 1px solid #33343c;
+              background: #1a1b21; }
+  #trackSel { width: 100%; margin-bottom: 8px; }
+  .sent { padding: 6px 8px; margin: 2px 0; border-radius: 4px; font-size: 13px; line-height: 1.4;
+          cursor: pointer; color: #d5d7df; border-left: 3px solid transparent; }
   .sent:hover { background: rgba(255,255,255,.06); }
   .sent.active { border-left-color: #ffd23c; background: rgba(255,210,60,.10); }
   .sent .pg { color: #7f8291; font-size: 11px; margin-right: 4px; }
-  #emptyTip { padding: 24px; color: #a8abb8; text-align: center; }
+  #tip { padding: 24px; color: #a8abb8; text-align: center; display: none; }
+  @media (max-width: 800px) { #sentPane { display: none; } }
 </style>
 </head>
 <body>
 <header>
   <span id="status"></span>
-  <button id="prevPage" title="Previous page">&lt; Prev</button>
-  <span id="pageInfo">-</span>
-  <button id="nextPage" title="Next page">Next &gt;</button>
+  <button id="btnPlay">⏯</button>
+  <button id="btnPrevTrack">⏮</button>
+  <button id="btnBack">−10s</button>
+  <button id="btnFwd">+10s</button>
+  <button id="btnNextTrack">⏭</button>
   <span class="spacer"></span>
-  <button id="zoomOut">-</button>
+  <button id="prevPage">◀</button>
+  <span id="pageInfo">-</span>
+  <button id="nextPage">▶</button>
+  <button id="zoomOut">−</button>
+  <button id="zoomFit">↔</button>
   <button id="zoomIn">+</button>
+  <button id="btnFollow" class="on"></button>
 </header>
 <main>
   <div id="pagePane">
     <div id="pageWrap"><canvas id="pdfCanvas"></canvas></div>
-    <div id="emptyTip" style="display:none">No sentence alignment data - PDF opened without read-along sync.</div>
+    <div id="tip"></div>
   </div>
-  <div id="sentPane"><h3 id="sentTitle">Sentences</h3><div id="sentList"></div></div>
+  <div id="sentPane"><select id="trackSel"></select><div id="sentList"></div></div>
 </main>
 <script>
 (function () {
   "use strict";
-  var T = {
-    en: { prev: "Previous page", next: "Next page", sentences: "Sentences",
-          noData: "No sentence alignment data - PDF opened without read-along sync." },
-    es: { prev: "Página anterior", next: "Página siguiente", sentences: "Frases",
-          noData: "No hay datos de alineación - PDF abierto sin sincronización." },
-    zh: { prev: "上一页", next: "下一页", sentences: "句子",
-          noData: "没有句子对齐数据 - PDF 已打开，但不带听读同步。" }
+  const T = {
+    en: { prev: "Previous page", next: "Next page", page: "Page {p} / {n}", follow: "Follow",
+          followTip: "Keep the current sentence in view", play: "Play / pause",
+          prevTrack: "Previous track", nextTrack: "Next track", back: "Back 10 s", fwd: "Forward 10 s",
+          zoomIn: "Zoom in", zoomOut: "Zoom out", fit: "Fit width", paused: "Paused",
+          noData: "No read-along data for this book - showing the PDF only.",
+          noPdf: "The source PDF of this book could not be found.", loadError: "Could not load the PDF: " },
+    es: { prev: "Página anterior", next: "Página siguiente", page: "Página {p} / {n}", follow: "Seguir",
+          followTip: "Mantener visible la frase actual", play: "Reproducir / pausar",
+          prevTrack: "Pista anterior", nextTrack: "Pista siguiente", back: "Atrás 10 s", fwd: "Adelante 10 s",
+          zoomIn: "Acercar", zoomOut: "Alejar", fit: "Ajustar al ancho", paused: "En pausa",
+          noData: "Este libro no tiene datos de lectura sincronizada; solo se muestra el PDF.",
+          noPdf: "No se encontró el PDF original de este libro.", loadError: "No se pudo cargar el PDF: " },
+    zh: { prev: "上一页", next: "下一页", page: "第 {p} / {n} 页", follow: "跟随",
+          followTip: "让当前句子保持可见", play: "播放 / 暂停",
+          prevTrack: "上一音轨", nextTrack: "下一音轨", back: "后退 10 秒", fwd: "前进 10 秒",
+          zoomIn: "放大", zoomOut: "缩小", fit: "适应宽度", paused: "已暂停",
+          noData: "此书没有听读同步数据，仅显示 PDF。",
+          noPdf: "找不到此书的源 PDF。", loadError: "无法加载 PDF：" }
   };
-  var L = T.zh;
-  var pdf = null, doc = null;
-  var scale = 1.6;
-  var currentPage = -1;
-  var data = { has_data: false, alignments: [], chapter_offsets: [], lang: "zh" };
-  var chapters = {};   // chapter_idx -> [sent...]
-  var chapterList = []; // sorted chapter idx
-  var state = { chapter_idx: -1, global_time: 0, playing: false };
-  var currentSents = [];
-  var activeSentIdx = -1;
-  var hlNode = null, hlWordNode = null;
-  var pagePane = document.getElementById("pagePane");
-  var pageWrap = document.getElementById("pageWrap");
-  var canvas = document.getElementById("pdfCanvas");
-  var ctx = canvas.getContext("2d");
-  var pageInfo = document.getElementById("pageInfo");
-  var statusEl = document.getElementById("status");
-  var sentList = document.getElementById("sentList");
-  var emptyTip = document.getElementById("emptyTip");
+  let L = T.en;
+  const token = new URLSearchParams(location.search).get("t") || "";
+  const api = (p) => p + (p.indexOf("?") >= 0 ? "&" : "?") + "t=" + encodeURIComponent(token);
+  const $ = (id) => document.getElementById(id);
+
+  let doc = null, data = { has_data: false, alignments: [], chapters: [] };
+  let byTrack = {};             // chapter_idx -> [sentences]
+  let scale = 1.4, fitMode = true, currentPage = 0, viewport = null, renderTask = null;
+  let state = { chapter_idx: -1, global_time: 0, playing: false, rate: 1 };
+  let shownTrack = -1, activeSent = null, activeIdx = -1;
+  let follow = true, userScrollUntil = 0, programmaticScroll = false;
+  let seekBusy = false;
+  const pagePane = $("pagePane"), pageWrap = $("pageWrap"), canvas = $("pdfCanvas");
+  const ctx = canvas.getContext("2d");
+  const hlNodes = [], wordNode = document.createElement("div");
+  wordNode.className = "hl-word"; wordNode.style.display = "none"; pageWrap.appendChild(wordNode);
 
   function fmt(t) {
     t = Math.max(0, Math.floor(t));
-    var m = Math.floor(t / 60), s = t % 60;
-    return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60;
+    const mm = (m < 10 ? "0" : "") + m, ss = (s < 10 ? "0" : "") + s;
+    return h ? h + ":" + mm + ":" + ss : mm + ":" + ss;
   }
-
-  function setText(id, key) { document.getElementById(id).textContent = key; }
 
   function applyLang(lang) {
-    L = T[lang] || T.zh;
-    setText("prevPage", L.prev);
-    setText("nextPage", L.next);
-    setText("sentTitle", L.sentences);
+    L = T[lang] || T.en;
+    document.documentElement.lang = lang || "en";
+    const tips = { prevPage: L.prev, nextPage: L.next, btnPlay: L.play, btnPrevTrack: L.prevTrack,
+      btnNextTrack: L.nextTrack, btnBack: L.back, btnFwd: L.fwd, zoomIn: L.zoomIn, zoomOut: L.zoomOut,
+      zoomFit: L.fit, btnFollow: L.followTip };
+    Object.keys(tips).forEach((id) => { $(id).title = tips[id]; });
+    $("btnFollow").textContent = L.follow;
   }
 
-  function wordRegex() { return /[\w\u4e00-\u9fff']+/g; }
-
-  function wordRange(sent, t) {
-    var text = sent.text || "";
-    var words = text.match(wordRegex());
-    var span = sent.audio_end - sent.audio_start;
-    var total = text.length || 1;
-    if (!words || span <= 0) return null;
-    var rel = Math.min(1, Math.max(0, (t - sent.audio_start) / span));
-    var charPos = rel * total;
-    var chosen = null;
-    for (var i = 0; i < words.length; i++) {
-      var w = words[i];
-      var start = text.indexOf(w, chosen ? chosen.end : 0);
-      if (start < 0 || start > charPos) break;
-      chosen = { start: start, end: start + w.length };
+  // ------------------------------------------------------------ geometry
+  // v2 geometry: {rects:[[page,x0,y0,x1,y1]], words:[[page,x0,y0,x1,y1,f0,f1]]} in PDF space.
+  // Legacy rows (older versions): bbox = [x0,y0,x1,y1] in top-left page points.
+  function geo(sent) { return sent && sent.bbox && typeof sent.bbox === "object" ? sent.bbox : null; }
+  function sentPage(sent) {
+    const g = geo(sent);
+    if (g && g.rects && g.rects.length) return g.rects[0][0] + 1;
+    return sent ? sent.page_no || 0 : 0;
+  }
+  function toCss(r) {  // r = [x0,y0,x1,y1] in PDF space -> CSS box
+    const v = viewport.convertToViewportRectangle(r);
+    return { x: Math.min(v[0], v[2]), y: Math.min(v[1], v[3]),
+             w: Math.abs(v[2] - v[0]), h: Math.abs(v[3] - v[1]) };
+  }
+  function sentRects(sent) {
+    const g = geo(sent);
+    if (!g || !viewport) return [];
+    if (Array.isArray(g) && g.length === 4) {  // legacy
+      return [{ x: g[0] * scale, y: g[1] * scale, w: (g[2] - g[0]) * scale, h: (g[3] - g[1]) * scale }];
     }
-    return chosen;
+    return (g.rects || []).filter((r) => r[0] + 1 === currentPage).map((r) => toCss(r.slice(1, 5)));
   }
-
-  function ensureHl() {
-    if (!hlNode) {
-      hlNode = document.createElement("div");
-      hlNode.className = "hl";
-      pageWrap.appendChild(hlNode);
-      hlWordNode = document.createElement("div");
-      hlWordNode.className = "hl-word";
-      pageWrap.appendChild(hlWordNode);
+  function wordRect(sent, t) {
+    const g = geo(sent);
+    if (!g || !g.words || !g.words.length || !viewport) return null;
+    const span = sent.audio_end - sent.audio_start;
+    if (span <= 0) return null;
+    const f = Math.min(1, Math.max(0, (t - sent.audio_start) / span));
+    let chosen = null;
+    for (const w of g.words) {
+      if (w[5] <= f) chosen = w; else break;
     }
+    if (!chosen || chosen[0] + 1 !== currentPage) return null;
+    return toCss(chosen.slice(1, 5));
   }
 
+  // ------------------------------------------------------------ render
+  function fitScale(page) {
+    const base = page.getViewport({ scale: 1 });
+    const avail = Math.max(200, pagePane.clientWidth - 40);
+    return Math.min(4, Math.max(0.4, avail / base.width));
+  }
   function renderPage(pageNo) {
-    if (!doc) return;
-    var p = Math.min(Math.max(1, pageNo), doc.numPages);
-    return doc.getPage(p).then(function (page) {
-      var viewport = page.getViewport({ scale: scale });
-      var w = Math.ceil(viewport.width), h = Math.ceil(viewport.height);
-      canvas.width = w; canvas.height = h;
-      canvas.style.width = w + "px"; canvas.style.height = h + "px";
-      return page.render({ canvasContext: ctx, viewport: viewport }).promise
-        .then(function () {
-          currentPage = p;
-          pageInfo.textContent = "Page " + p + " / " + doc.numPages;
-          return page;
-        });
+    if (!doc) return Promise.resolve();
+    const p = Math.min(Math.max(1, pageNo), doc.numPages);
+    return doc.getPage(p).then((page) => {
+      if (fitMode) scale = fitScale(page);
+      viewport = page.getViewport({ scale: scale });
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(viewport.width * dpr);
+      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.style.width = Math.floor(viewport.width) + "px";
+      canvas.style.height = Math.floor(viewport.height) + "px";
+      if (renderTask) { try { renderTask.cancel(); } catch (e) { /* ignore */ } }
+      renderTask = page.render({ canvasContext: ctx, viewport: viewport,
+                                 transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null });
+      currentPage = p;
+      $("pageInfo").textContent = L.page.replace("{p}", p).replace("{n}", doc.numPages);
+      return renderTask.promise.catch(() => {}).then(() => { renderTask = null; drawHighlight(false); });
     });
   }
 
-  function scalePage(pageNo, sc) {
-    if (!doc) return;
-    scale = sc;
-    var cur = currentPage >= 0 ? currentPage : pageNo;
-    return renderPage(cur);
-  }
-
-  function clearHl() {
-    if (hlNode) hlNode.style.display = "none";
-    if (hlWordNode) hlWordNode.style.display = "none";
-  }
-
-  function showHl(sent) {
-    if (!sent || !sent.bbox) { clearHl(); return; }
-    ensureHl();
-    var b = sent.bbox;
-    var x = b[0] * scale, y = b[1] * scale, w = (b[2] - b[0]) * scale, h = (b[3] - b[1]) * scale;
-    hlNode.style.display = "block";
-    hlNode.style.left = x + "px"; hlNode.style.top = y + "px";
-    hlNode.style.width = w + "px"; hlNode.style.height = h + "px";
-    // word highlight inside the sentence bbox (character ratio)
-    var r = wordRange(sent, state.global_time);
-    if (r) {
-      var text = sent.text || "";
-      var total = text.length || 1;
-      var wx0 = x + w * (r.start / total), wx1 = x + w * (r.end / total);
-      hlWordNode.style.display = "block";
-      hlWordNode.style.left = wx0 + "px"; hlWordNode.style.top = y + "px";
-      hlWordNode.style.width = Math.max(2, wx1 - wx0) + "px";
-      hlWordNode.style.height = h + "px";
-    } else {
-      hlWordNode.style.display = "none";
+  function drawHighlight(scroll) {
+    const rects = activeSent ? sentRects(activeSent) : [];
+    while (hlNodes.length < rects.length) {
+      const d = document.createElement("div"); d.className = "hl"; pageWrap.appendChild(d); hlNodes.push(d);
     }
-    // auto-scroll: bring the sentence into the middle of the viewport
-    var pane = pagePane;
-    var viewH = pane.clientHeight, viewW = pane.clientWidth;
-    var absX = pane.scrollLeft + x - (viewW - w) / 2;
-    var absY = pane.scrollTop + y - (viewH - h) / 2;
-    pane.scrollLeft = Math.max(0, absX);
-    pane.scrollTop = Math.max(0, absY);
+    hlNodes.forEach((n, i) => {
+      const r = rects[i];
+      if (!r) { n.style.display = "none"; return; }
+      Object.assign(n.style, { display: "block", left: r.x - 2 + "px", top: r.y - 1 + "px",
+                               width: r.w + 4 + "px", height: r.h + 2 + "px" });
+    });
+    const w = activeSent ? wordRect(activeSent, state.global_time) : null;
+    if (w) Object.assign(wordNode.style, { display: "block", left: w.x - 1 + "px", top: w.y + "px",
+                                           width: Math.max(3, w.w + 2) + "px", height: w.h + "px" });
+    else wordNode.style.display = "none";
+    if (scroll && rects.length) ensureVisible(rects);
   }
 
-  function sentenceAt(t) {
-    if (!currentSents.length) return -1;
-    if (t < currentSents[0].audio_start) return 0;
-    var lo = 0, hi = currentSents.length - 1;
+  function ensureVisible(rects) {
+    if (!follow || Date.now() < userScrollUntil) return;
+    const top = Math.min(...rects.map((r) => r.y)), bottom = Math.max(...rects.map((r) => r.y + r.h));
+    const left = Math.min(...rects.map((r) => r.x)), right = Math.max(...rects.map((r) => r.x + r.w));
+    const offY = pageWrap.offsetTop, offX = pageWrap.offsetLeft;
+    const vTop = pagePane.scrollTop, vBottom = vTop + pagePane.clientHeight;
+    const vLeft = pagePane.scrollLeft, vRight = vLeft + pagePane.clientWidth;
+    const margin = 60;
+    programmaticScroll = true;
+    if (offY + top < vTop + margin || offY + bottom > vBottom - margin) {
+      pagePane.scrollTop = Math.max(0, offY + (top + bottom) / 2 - pagePane.clientHeight / 2);
+    }
+    if (offX + left < vLeft || offX + right > vRight) {
+      pagePane.scrollLeft = Math.max(0, offX + left - 40);
+    }
+    setTimeout(() => { programmaticScroll = false; }, 50);
+  }
+
+  // ------------------------------------------------------------ sentences
+  function trackOf(sentOrIdx) { return typeof sentOrIdx === "number" ? sentOrIdx : sentOrIdx.chapter_idx; }
+  function buildSentList(track) {
+    shownTrack = track;
+    $("trackSel").value = String(track);
+    const list = $("sentList");
+    list.innerHTML = "";
+    (byTrack[track] || []).forEach((s, i) => {
+      const div = document.createElement("div");
+      div.className = "sent";
+      const pg = document.createElement("span");
+      pg.className = "pg"; pg.textContent = "p" + (sentPage(s) || "?");
+      div.appendChild(pg);
+      div.appendChild(document.createTextNode((s.text || "").replace(/\s+/g, " ")));
+      div.addEventListener("click", () => seekTo(s));
+      list.appendChild(div);
+    });
+  }
+  function markActive() {
+    const nodes = $("sentList").children;
+    for (let i = 0; i < nodes.length; i++) {
+      const on = activeSent && shownTrack === activeSent.chapter_idx && i === activeIdx;
+      if (on !== nodes[i].classList.contains("active")) {
+        nodes[i].classList.toggle("active", on);
+        if (on && follow) nodes[i].scrollIntoView({ block: "nearest" });
+      }
+    }
+  }
+  function sentenceAt(list, t) {
+    if (!list || !list.length) return -1;
+    let lo = 0, hi = list.length - 1;
+    if (t < list[0].audio_start) return 0;
     while (lo < hi) {
-      var mid = (lo + hi + 1) >> 1;
-      if (currentSents[mid].audio_start <= t) lo = mid;
-      else hi = mid - 1;
+      const mid = (lo + hi + 1) >> 1;
+      if (list[mid].audio_start <= t) lo = mid; else hi = mid - 1;
     }
     return lo;
   }
 
-  function chapterForTime(t) {
-    var offs = data.chapter_offsets || [];
-    var idx = 0;
-    for (var i = 0; i < chapterList.length; i++) {
-      var o = i < offs.length ? offs[i] : 0;
-      if (o <= t) idx = chapterList[i];
-      else break;
-    }
-    return idx;
+  function seekTo(s) {
+    if (seekBusy) return;
+    seekBusy = true;
+    userScrollUntil = 0;
+    fetch(api("/api/seek"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio_start: s.audio_start, chapter_idx: s.chapter_idx }) })
+      .catch(() => {}).finally(() => { setTimeout(() => { seekBusy = false; }, 250); });
+  }
+  function control(action) {
+    fetch(api("/api/control"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: action }) }).catch(() => {});
   }
 
-  function buildSentList(chIdx) {
-    sentList.innerHTML = "";
-    currentSents = (data.alignments || []).filter(function (s) { return s.chapter_idx === chIdx; });
-    currentSents.forEach(function (s, i) {
-      var div = document.createElement("div");
-      div.className = "sent";
-      var pg = document.createElement("span");
-      pg.className = "pg";
-      pg.textContent = "p" + (s.page_no || "?");
-      div.appendChild(pg);
-      div.appendChild(document.createTextNode((s.text || "").replace(/\s+/g, " ").slice(0, 90)));
-      div.addEventListener("click", function () {
-        if (seekBusy) return; // rapid double-clicks must not re-seek
-        seekBusy = true;
-        fetch("/api/seek", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audio_start: s.audio_start, chapter_idx: s.chapter_idx })
-        }).catch(function () {}).finally(function () {
-          setTimeout(function () { seekBusy = false; }, 200);
-        });
-      });
-      sentList.appendChild(div);
-    });
-  }
-
-  function syncSentListUI() {
-    var nodes = sentList.children;
-    for (var i = 0; i < nodes.length; i++) {
-      nodes[i].classList.toggle("active", i === activeSentIdx);
-      if (i === activeSentIdx) nodes[i].scrollIntoView({ block: "nearest" });
-    }
-  }
-
+  // ------------------------------------------------------------ state sync
+  let lastPolledTrack = -2;
   function onState() {
     if (!data.has_data) return;
-    var ch = state.chapter_idx;
-    if (ch < 0) {
-      ch = chapterForTime(state.global_time);
+    let track = state.chapter_idx;
+    if (track < 0) return;
+    const list = byTrack[track] || [];
+    const idx = sentenceAt(list, state.global_time);
+    const sent = idx >= 0 ? list[idx] : null;
+    if (track !== lastPolledTrack) {   // playback moved to another track
+      lastPolledTrack = track;
+      buildSentList(track);
     }
-    if (ch !== state.chapter_idx) {
-      // chapter changed: rebuild list and jump to its page
-      buildSentList(ch);
-      state.chapter_idx = ch;
-    }
-    var idx = sentenceAt(state.global_time);
-    activeSentIdx = idx;
-    syncSentListUI();
-    var sent = idx >= 0 ? currentSents[idx] : null;
-    if (sent && sent.page_no && sent.page_no !== currentPage) {
-      renderPage(sent.page_no).then(function () { showHl(sent); });
+    const changed = sent !== activeSent;
+    activeSent = sent; activeIdx = idx;
+    markActive();
+    const page = sentPage(sent);
+    // Turn pages while playing, or when the sentence changed (e.g. after a
+    // click-to-seek while paused) - but never right after the user browsed.
+    const followPage = follow && (state.playing || changed) && Date.now() >= userScrollUntil;
+    if (sent && page && page !== currentPage && followPage) {
+      renderPage(page).then(() => drawHighlight(true));
     } else {
-      showHl(sent);
+      drawHighlight(changed || state.playing);
     }
   }
 
   function poll() {
-    fetch("/api/state").then(function (r) { return r.json(); })
-      .then(function (st) {
-        state.global_time = st.global_time;
-        state.playing = !!st.playing;
-        state.rate = st.rate || 1;
-        statusEl.textContent = state.playing
-          ? "● " + fmt(state.global_time) + "  " + state.rate.toFixed(2) + "x"
-          : "❚❚ " + fmt(state.global_time);
-        // Drive highlight / auto-scroll / page turn from every state poll.
-        onState();
-      }).catch(function () {})
-      .finally(function () { setTimeout(poll, 400); });
+    fetch(api("/api/state"), { cache: "no-store" }).then((r) => r.json()).then((st) => {
+      state = st;
+      $("status").textContent = (st.playing ? "▶ " : "❚❚ ") + fmt(st.global_time) +
+        (st.playing ? "  " + Number(st.rate || 1).toFixed(2) + "x" : "  " + L.paused);
+      onState();
+    }).catch(() => {}).finally(() => { setTimeout(poll, 250); });
   }
 
-  document.getElementById("prevPage").addEventListener("click", function () {
-    if (!doc) return;
-    if (data.has_data) {
-      // jump to the page of the previous sentence in the current chapter
-      var idx = activeSentIdx > 0 ? activeSentIdx - 1 : 0;
-      var pg = currentSents[idx] ? currentSents[idx].page_no : 1;
-      renderPage(pg || 1);
-    } else {
-      renderPage(Math.max(1, currentPage - 1));
+  // ------------------------------------------------------------ input
+  function userNav() { userScrollUntil = Date.now() + 6000; }
+  pagePane.addEventListener("scroll", () => { if (!programmaticScroll) userNav(); });
+  pagePane.addEventListener("wheel", userNav, { passive: true });
+  $("prevPage").addEventListener("click", () => { userNav(); if (currentPage > 1) renderPage(currentPage - 1); });
+  $("nextPage").addEventListener("click", () => { userNav(); if (doc && currentPage < doc.numPages) renderPage(currentPage + 1); });
+  $("zoomIn").addEventListener("click", () => { fitMode = false; scale = Math.min(4, scale * 1.2); renderPage(currentPage); });
+  $("zoomOut").addEventListener("click", () => { fitMode = false; scale = Math.max(0.4, scale / 1.2); renderPage(currentPage); });
+  $("zoomFit").addEventListener("click", () => { fitMode = true; renderPage(currentPage); });
+  $("btnFollow").addEventListener("click", () => {
+    follow = !follow; $("btnFollow").classList.toggle("on", follow);
+    if (follow) { userScrollUntil = 0; onState(); }
+  });
+  $("btnPlay").addEventListener("click", () => control("toggle"));
+  $("btnPrevTrack").addEventListener("click", () => control("prev"));
+  $("btnNextTrack").addEventListener("click", () => control("next"));
+  $("btnBack").addEventListener("click", () => control("back"));
+  $("btnFwd").addEventListener("click", () => control("forward"));
+  $("trackSel").addEventListener("change", (e) => {
+    const t = Number(e.target.value);
+    buildSentList(t); markActive();
+    const first = (byTrack[t] || [])[0];
+    if (first && sentPage(first)) { userNav(); renderPage(sentPage(first)); }
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "SELECT") return;
+    if (e.code === "Space") { e.preventDefault(); control("toggle"); }
+    else if (e.code === "PageDown") { userNav(); if (doc && currentPage < doc.numPages) renderPage(currentPage + 1); }
+    else if (e.code === "PageUp") { userNav(); if (currentPage > 1) renderPage(currentPage - 1); }
+  });
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { if (fitMode && doc) renderPage(currentPage); }, 150);
+  });
+  // Click on the page text: seek to the sentence under the pointer.
+  canvas.addEventListener("click", (e) => {
+    if (!data.has_data || !viewport) return;
+    const box = canvas.getBoundingClientRect();
+    const x = e.clientX - box.left, y = e.clientY - box.top;
+    for (const s of data.alignments) {
+      if (sentPage(s) > currentPage + 1) continue;
+      for (const r of sentRects(s)) {
+        if (x >= r.x - 2 && x <= r.x + r.w + 2 && y >= r.y - 2 && y <= r.y + r.h + 2) { seekTo(s); return; }
+      }
     }
   });
-  document.getElementById("nextPage").addEventListener("click", function () {
-    if (doc && currentPage < doc.numPages) renderPage(currentPage + 1);
-  });
-  document.getElementById("zoomIn").addEventListener("click", function () {
-    scalePage(currentPage >= 0 ? currentPage : 1, Math.min(4, scale * 1.25));
-  });
-  document.getElementById("zoomOut").addEventListener("click", function () {
-    scalePage(currentPage >= 0 ? currentPage : 1, Math.max(0.5, scale / 1.25));
-  });
 
+  // ------------------------------------------------------------ init
+  function showTip(text) { $("tip").style.display = "block"; $("tip").textContent = text; }
   function init() {
-    fetch("/api/data").then(function (r) { return r.json(); }).then(function (d) {
+    fetch(api("/api/data")).then((r) => r.json()).then((d) => {
       data = d;
-      applyLang(d.lang || "zh");
-      return pdfjsLib.getDocument({ url: "/pdf" }).promise;
-    }).then(function (d) {
-      doc = d;
+      applyLang(d.lang || "en");
+      if (d.title) document.title = d.title + " - PDF2Audiobook";
+      if (!d.has_pdf) { showTip(L.noPdf); $("sentPane").style.display = "none"; return null; }
+      byTrack = {};
+      (d.alignments || []).forEach((s) => { (byTrack[s.chapter_idx] = byTrack[s.chapter_idx] || []).push(s); });
+      const sel = $("trackSel");
+      (d.chapters || []).forEach((c) => {
+        if (!byTrack[c.idx]) return;
+        const o = document.createElement("option");
+        o.value = String(c.idx); o.textContent = (c.idx + 1) + ". " + c.title;
+        sel.appendChild(o);
+      });
+      return pdfjsLib.getDocument({ url: api("/pdf") }).promise;
+    }).then((pdfDoc) => {
+      if (!pdfDoc) return;
+      doc = pdfDoc;
       if (data.has_data) {
-        // keep chapter list sorted
-        var set = {};
-        (data.alignments || []).forEach(function (s) { set[s.chapter_idx] = 1; });
-        chapterList = Object.keys(set).map(Number).sort(function (a, b) { return a - b; });
-        buildSentList(chapterList.length ? chapterList[0] : -1);
-        var firstSent = currentSents[0];
-        renderPage(firstSent && firstSent.page_no ? firstSent.page_no : 1);
-        statusEl.textContent = "";
+        const tracks = Object.keys(byTrack).map(Number).sort((a, b) => a - b);
+        buildSentList(tracks.length ? tracks[0] : 0);
+        const first = (byTrack[tracks[0]] || [])[0];
+        renderPage(sentPage(first) || 1);
         poll();
       } else {
-        // graceful degradation: plain PDF viewer
-        document.getElementById("sentPane").style.display = "none";
-        emptyTip.style.display = "block";
-        emptyTip.textContent = L.noData;
+        $("sentPane").style.display = "none";
+        showTip(L.noData);
         renderPage(1);
       }
-    }).catch(function (e) {
-      emptyTip.style.display = "block";
-      emptyTip.textContent = "PDF load error: " + e;
-    });
+    }).catch((e) => showTip(L.loadError + e));
   }
-
+  applyLang("en");
   init();
 })();
 </script>

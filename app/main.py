@@ -2,19 +2,25 @@
 
 Main window provides:
   - a gallery of converted audiobooks (SQLite-backed)
-  - PDF -> audiobook conversion with progress feedback
-  - chapter-based playback with resume support
+  - a PDF -> audiobook conversion queue with progress, pause and resume
+  - chapter-based playback with resume, speed, bookmarks and sleep timer
+  - a browser read-along view, M4B export and an in-app voice manager
 """
+import collections
+import json
 import logging
 import os
+import shutil
 import sys
 import webbrowser
 
-from PyQt6.QtCore import QLockFile, QRect, QSettings, QSize, Qt, QTimer
+from PyQt6.QtCore import QLockFile, QRect, QSettings, QSize, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
     QAction,
+    QActionGroup,
     QBrush,
     QColor,
+    QDesktopServices,
     QFont,
     QIcon,
     QKeySequence,
@@ -24,350 +30,242 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
-    QDialog,
     QFileDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
-    QListView,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
 
+from . import __version__
 from .browser_pdf import ReadAlongServer
+from .converter import PiperTTS, export_m4b, find_ffmpeg, needs_realign, realign_book, sanitize
 from .database import AudiobookDB
+from .dialogs import (
+    BookmarkDialog,
+    ConvertDialog,
+    EditBookDialog,
+    VoiceManagerDialog,
+    ask,
+    fmt_duration,
+)
 from .i18n import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, get_language, set_language, tr
+from .mediakeys import GlobalMediaKeys
 from .player import AudioPlayer
 from .theme import apply_theme
-from .updater import check_for_updates
-from .worker import QueueWorker
+from .updater import RELEASES_PAGE, check_for_updates, is_newer
+from .voices import list_voice_models, preview_text, voice_display_name
+from .worker import QueueWorker, TaskThread
 
-APP_VERSION = "1.4.1"
+APP_VERSION = __version__
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PDF2Audiobook"
-)
+DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PDF2Audiobook")
 DB_PATH = os.path.join(DATA_DIR, "library.db")
 BOOKS_DIR = os.path.join(DATA_DIR, "books")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
 LOG_DIR = os.path.join(DATA_DIR, "logs")
 LOCK_PATH = os.path.join(DATA_DIR, "app.lock")
+CATALOG_CACHE = os.path.join(DATA_DIR, "voices_catalog.json")
+
+PLAYBACK_SPEEDS = [0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+JUMP_SECONDS = 10
+
+REPEAT_OFF, REPEAT_ALL, REPEAT_ONE = 0, 1, 2
+REPEAT_ICON_FILES = {REPEAT_OFF: "repeat_off.png", REPEAT_ALL: "repeat_all.png", REPEAT_ONE: "repeat_one.png"}
+REPEAT_LABEL_KEYS = {REPEAT_OFF: "repeat_off", REPEAT_ALL: "repeat_all", REPEAT_ONE: "repeat_one"}
+SLEEP_END_OF_TRACK = -1
 
 
 def resource_path(rel):
     """Resolve asset paths when frozen by PyInstaller."""
-    base = getattr(sys, "_MEIPASS", APP_DIR)
-    return os.path.join(base, rel)
+    return os.path.join(getattr(sys, "_MEIPASS", APP_DIR), rel)
 
 
-# Piper voice names use "<lang>_<region>-<voice>[-<quality>]".
-LANG_LABELS = {
-    "en_US": "English (US)",
-    "en_GB": "English (UK)",
-    "zh_CN": "Chinese (Mandarin)",
-    "es_ES": "Spanish (Spain)",
-    "es_MX": "Spanish (Mexico)",
-    "fr_FR": "French (France)",
-    "de_DE": "German (Germany)",
-    "it_IT": "Italian (Italy)",
-    "pt_PT": "Portuguese (Portugal)",
-    "pt_BR": "Portuguese (Brazil)",
-    "ja_JP": "Japanese",
-    "ko_KR": "Korean",
-    "ru_RU": "Russian",
-}
+def asset_icon(name):
+    return QIcon(resource_path(os.path.join("assets", name)))
 
 
-def voice_display_name(model_name):
-    """Turn 'en_US-lessac-medium' into 'English (US) — lessac medium'."""
-    stem = os.path.splitext(model_name)[0]
-    parts = stem.split("-", 1)
-    lang = parts[0] if parts else stem
-    rest = parts[1].replace("-", " ") if len(parts) > 1 else ""
-    label = LANG_LABELS.get(lang, lang.replace("_", " "))
-    return f"{label} — {rest}".strip(" —")
+class ClickSlider(QSlider):
+    """Slider that jumps to the clicked position instead of page-stepping."""
 
-
-def list_voice_models(models_dir):
-    """Return [(model_path, config_path, display_name), ...] sorted by name."""
-    if not os.path.isdir(models_dir):
-        return []
-    result = []
-    for name in sorted(os.listdir(models_dir)):
-        if not name.endswith(".onnx"):
-            continue
-        model = os.path.join(models_dir, name)
-        config = model + ".json"
-        if not os.path.exists(config):
-            config = None
-        result.append((model, config, voice_display_name(name)))
-    return result
-
-
-def fmt_duration(seconds):
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-REPEAT_OFF = 0
-REPEAT_ALL = 1
-REPEAT_ONE = 2
-REPEAT_ICON_FILES = {
-    REPEAT_OFF: "repeat_off.png",
-    REPEAT_ALL: "repeat_all.png",
-    REPEAT_ONE: "repeat_one.png",
-}
-REPEAT_LABEL_KEYS = {
-    REPEAT_OFF: "repeat_off",
-    REPEAT_ALL: "repeat_all",
-    REPEAT_ONE: "repeat_one",
-}
+    def mousePressEvent(self, event):  # noqa: N802 - Qt API
+        if event.button() == Qt.MouseButton.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            handle = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, opt, QStyle.SubControl.SC_SliderHandle, self
+            )
+            pt = event.position().toPoint()
+            if not handle.contains(pt):
+                span = max(1, self.width() - handle.width())
+                value = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), pt.x() - handle.width() // 2, span
+                )
+                self.setValue(value)
+        super().mousePressEvent(event)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF2Audiobook")
-        self.resize(860, 560)
+        self.resize(980, 640)
+        self.setAcceptDrops(True)
 
         self.db = AudiobookDB(DB_PATH)
         self.player = AudioPlayer()
+        self.preview_player = AudioPlayer()
         self.worker = None
+        self._tasks = set()
+        self._conv_failures = []
+        self._job_prefix = ""
         self._conv_paused = False
 
         self.current_book = None
         self.current_chapters = []
         self.current_chapter_idx = -1
         self._chapter_offsets = []
-        self._slider_guard = False
+        self._resume_pos = 0.0
+        self._slider_dragging = False
         self.repeat_mode = REPEAT_OFF
         self._book_items = {}
+        self._cover_cache = {}
         self._read_server = None
-        # Seeks from the browser reader arrive on HTTP worker threads.
-        # Queue them and drain on the UI tick so playback restarts are
-        # serialized on the main thread (no concurrent play(), no cross-
-        # thread Qt calls) and the last click wins.
-        self._seek_requests = []
+        # Commands from the browser reader arrive on HTTP threads; they are
+        # queued and applied on the UI tick (main thread, serialized).
+        self._commands = collections.deque()
+        self._media_keys = None
+        self._tts_preview_cache = {}
 
         self.settings = QSettings("PDF2Audiobook", "PDF2Audiobook")
         self._theme_mode = str(self.settings.value("ui/theme", "dark") or "dark")
-        self._sleep_remaining_min = 0  # 0 = sleep timer off
+        self._sleep_remaining_min = 0
+        self._sleep_eot = False  # "stop at end of current track"
         self._sleep_timer = QTimer(self)
         self._sleep_timer.timeout.connect(self._on_sleep_tick)
 
-        self._build_menu()
+        try:
+            rate = float(self.settings.value("player/rate", 1.0) or 1.0)
+            self.player.set_rate(rate)
+        except (TypeError, ValueError):
+            pass
+
         self._build_ui()
+        self._build_menu()
+        self._build_shortcuts()
+        self._apply_ui_texts()
         self._reload_books()
 
-        # UI ticker: keep the progress slider in sync, auto-advance chapters.
         self._ui_timer = QTimer(self)
-        self._ui_timer.setInterval(500)
+        self._ui_timer.setInterval(250)
         self._ui_timer.timeout.connect(self._tick)
         self._ui_timer.start()
 
-        # Keyboard shortcuts: Space toggles play/pause, Ctrl+Left/Right skip
-        # chapters, R cycles the repeat mode, Ctrl+B adds a bookmark,
-        # Ctrl+Up/Down change playback speed.
-        QShortcut(QKeySequence("Space"), self, activated=self._toggle_play)
-        QShortcut(
-            QKeySequence("Ctrl+Left"), self, activated=lambda: self._skip(-1)
-        )
-        QShortcut(
-            QKeySequence("Ctrl+Right"), self, activated=lambda: self._skip(1)
-        )
-        QShortcut(QKeySequence("R"), self, activated=self._toggle_repeat)
-        QShortcut(QKeySequence("Ctrl+B"), self, activated=self._add_bookmark)
-        QShortcut(
-            QKeySequence("Ctrl+Up"),
-            self,
-            activated=lambda: self._cycle_speed(1),
-        )
-        QShortcut(
-            QKeySequence("Ctrl+Down"),
-            self,
-            activated=lambda: self._cycle_speed(-1),
-        )
-
-        # Persist listening progress every 5 seconds while playing.
         self._save_timer = QTimer(self)
         self._save_timer.setInterval(5000)
         self._save_timer.timeout.connect(self._save_progress)
 
-    # ------------------------------------------------------------------ UI
-    def _build_menu(self):
-        menubar = self.menuBar()
-        self.lang_menu = menubar.addMenu(tr("menu_language"))
-        self._lang_actions = {}
-        for code in SUPPORTED_LANGUAGES:
-            act = QAction(LANGUAGE_NAMES[code], self, checkable=True)
-            act.setChecked(code == get_language())
-            act.triggered.connect(
-                lambda checked, c=code: self._switch_language(c)
-            )
-            self.lang_menu.addAction(act)
-            self._lang_actions[code] = act
+        if self._settings_bool("player/global_media_keys", False):
+            QTimer.singleShot(0, lambda: self._set_global_media_keys(True))
 
-        # Theme switcher
-        self.theme_menu = menubar.addMenu(tr("menu_theme"))
-        self._theme_actions = {}
-        for mode, key in (("dark", "theme_dark"), ("light", "theme_light")):
-            act = QAction(tr(key), self, checkable=True)
-            act.setChecked(mode == self._theme_mode)
-            act.triggered.connect(
-                lambda checked, m=mode: self._set_theme(m)
-            )
-            self.theme_menu.addAction(act)
-            self._theme_actions[mode] = act
+    # ============================================================ helpers
+    def _settings_bool(self, key, default):
+        val = self.settings.value(key, default)
+        if isinstance(val, str):
+            return val.lower() in ("1", "true", "yes")
+        return bool(val)
 
-        # Sleep timer
-        self.sleep_menu = menubar.addMenu(tr("menu_sleep_timer"))
-        self._sleep_actions = {}
-        off = QAction(tr("sleep_off"), self, checkable=True)
-        off.setChecked(True)
-        off.triggered.connect(lambda: self._set_sleep_timer(0))
-        self.sleep_menu.addAction(off)
-        self._sleep_actions[0] = off
-        for minutes in (15, 30, 45, 60, 90, 120):
-            act = QAction(
-                tr("sleep_minutes", minutes=minutes), self, checkable=True
-            )
-            act.triggered.connect(
-                lambda checked, m=minutes: self._set_sleep_timer(m)
-            )
-            self.sleep_menu.addAction(act)
-            self._sleep_actions[minutes] = act
+    def _run_task(self, fn, on_success=None, on_fail=None, progress_dialog_title=None,
+                  on_cancel=None):
+        """Run fn(progress_cb, cancel_event) in a TaskThread (optionally with a dialog)."""
+        task = TaskThread(fn, self)
+        dlg = None
+        if progress_dialog_title:
+            dlg = QProgressDialog(progress_dialog_title, tr("cancel"), 0, 100, self)
+            dlg.setWindowTitle("PDF2Audiobook")
+            dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            dlg.setMinimumDuration(300)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.canceled.connect(task.cancel)
 
-        # Bookmarks
-        self.bookmarks_menu = menubar.addMenu(tr("bookmarks_menu"))
-        act_add = QAction(tr("add_bookmark"), self)
-        act_add.setShortcut(QKeySequence("Ctrl+B"))
-        act_add.triggered.connect(self._add_bookmark)
-        self.bookmarks_menu.addAction(act_add)
-        self.bookmarks_menu.addSeparator()
-        self._bookmarks_list_action = self.bookmarks_menu.addAction(
-            tr("no_bookmarks"), self._show_bookmarks
-        )
+            def prog(p, m):
+                dlg.setValue(p)
+                if m:
+                    dlg.setLabelText(m)
 
-        # Updates
-        self.updates_menu = menubar.addMenu("Help")
-        act_update = QAction(tr("update_ok"), self)
-        act_update.triggered.connect(self._check_updates_now)
-        self.updates_menu.addAction(act_update)
+            task.progress.connect(prog)
 
-    def _set_theme(self, mode):
-        self._theme_mode = mode
-        self.settings.setValue("ui/theme", mode)
-        for m, act in self._theme_actions.items():
-            act.setChecked(m == mode)
-        apply_theme(QApplication.instance(), mode)
-        self._update_repeat_button()
+        def finish():
+            self._tasks.discard(task)
+            if dlg is not None:
+                dlg.close()
 
-    def _set_sleep_timer(self, minutes):
-        for m, act in self._sleep_actions.items():
-            act.setChecked(m == minutes)
-        self._sleep_remaining_min = minutes
-        self._sleep_timer.stop()
-        if minutes > 0:
-            self._sleep_timer.start(60 * 1000)
-        self._update_statusbar()
+        task.finished.connect(finish)
+        if on_success:
+            task.succeeded.connect(on_success)
+        task.failed.connect(on_fail or (lambda m: QMessageBox.warning(self, "PDF2Audiobook", m)))
+        if on_cancel:
+            task.cancelled.connect(on_cancel)
+        self._tasks.add(task)
+        task.start()
+        return task
 
-    def _on_sleep_tick(self):
-        if self._sleep_remaining_min <= 0:
-            self._sleep_timer.stop()
-            return
-        self._sleep_remaining_min -= 1
-        self._update_statusbar()
-        if self._sleep_remaining_min <= 0:
-            self._stop_playback()
-            self._save_progress()
+    def _is_converting(self):
+        return self.worker is not None and self.worker.isRunning()
 
-    def _switch_language(self, code):
-        if code == get_language():
-            return
-        set_language(code)
-        QSettings("PDF2Audiobook", "PDF2Audiobook").setValue(
-            "ui/language", code
-        )
-        for c, act in self._lang_actions.items():
-            act.setChecked(c == code)
-        self._apply_ui_texts()
-        self._reload_books()
-        self._update_now_label()
+    def _converting_ids(self):
+        if not self._is_converting():
+            return set()
+        ids = set(self.worker.queued_book_ids())
+        if self.worker.current_book_id:
+            ids.add(self.worker.current_book_id)
+        return ids
 
-    def _apply_ui_texts(self):
-        self.lang_menu.setTitle(tr("menu_language"))
-        self.theme_menu.setTitle(tr("menu_theme"))
-        self.sleep_menu.setTitle(tr("menu_sleep_timer"))
-        self.bookmarks_menu.setTitle(tr("bookmarks_menu"))
-        for mode, key in (("dark", "theme_dark"), ("light", "theme_light")):
-            self._theme_actions[mode].setText(tr(key))
-        for minutes, act in self._sleep_actions.items():
-            act.setText(
-                tr("sleep_off") if minutes == 0 else tr("sleep_minutes", minutes=minutes)
-            )
-        self.search_box.setPlaceholderText(tr("search_placeholder"))
-        self.btn_convert.setText(tr("convert_btn"))
-        self.btn_open_dir.setText(tr("open_dir_btn"))
-        self.btn_play.setText(tr("play"))
-        self.btn_play.setToolTip(tr("play"))
-        self.btn_stop.setToolTip(tr("stop"))
-        self.btn_prev.setToolTip(tr("prev"))
-        self.btn_next.setToolTip(tr("next"))
-        self.btn_repeat.setToolTip(tr(REPEAT_LABEL_KEYS[self.repeat_mode]))
-        self.btn_cancel.setText(tr("cancel"))
-        self.btn_pause.setText(
-            tr("resume_conv") if self._conv_paused else tr("pause_conv")
-        )
-        self.btn_readalong.setText(tr("readalong_toggle"))
-        self.btn_readalong.setToolTip(tr("readalong_toggle"))
-        if self.current_chapter_idx < 0:
-            self.now_label.setText(tr("nothing_playing"))
-        self._update_statusbar()
-
+    # ================================================================ UI
     def _build_ui(self):
         central = QWidget(self)
         root = QVBoxLayout(central)
 
-        # Top bar
         top = QHBoxLayout()
-        self.btn_convert = QPushButton(tr("convert_btn"))
-        self.btn_convert.clicked.connect(self._start_conversion)
-        self.btn_open_dir = QPushButton(tr("open_dir_btn"))
+        self.btn_convert = QPushButton()
+        self.btn_convert.setObjectName("primaryButton")
+        self.btn_convert.clicked.connect(lambda: self._start_conversion())
+        self.btn_voices = QPushButton()
+        self.btn_voices.clicked.connect(self._manage_voices)
+        self.btn_open_dir = QPushButton()
         self.btn_open_dir.clicked.connect(self._open_library_dir)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText(tr("search_placeholder"))
         self.search_box.setClearButtonEnabled(True)
-        self.search_box.setFixedWidth(200)
+        self.search_box.setFixedWidth(220)
         self.search_box.textChanged.connect(self._apply_book_filter)
         top.addWidget(self.btn_convert)
+        top.addWidget(self.btn_voices)
         top.addWidget(self.btn_open_dir)
         top.addStretch(1)
         top.addWidget(self.search_box)
         root.addLayout(top)
 
-        # Progress row (hidden until a conversion runs)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
         self.progress_label = QLabel("")
-        self.progress_label.setVisible(False)
-        self.btn_pause = QPushButton(tr("pause_conv"))
-        self.btn_pause.setVisible(False)
+        self.progress_label.setObjectName("mutedLabel")
+        self.btn_pause = QPushButton()
         self.btn_pause.clicked.connect(self._toggle_conv_pause)
-        self.btn_cancel = QPushButton(tr("cancel"))
-        self.btn_cancel.setVisible(False)
+        self.btn_cancel = QPushButton()
         self.btn_cancel.clicked.connect(self._cancel_conversion)
         progress_row = QHBoxLayout()
         progress_row.addWidget(self.progress_bar, 1)
@@ -375,159 +273,375 @@ class MainWindow(QMainWindow):
         progress_row.addWidget(self.btn_cancel)
         root.addLayout(progress_row)
         root.addWidget(self.progress_label)
+        self._set_progress_visible(False)
 
-        # Gallery + chapters
         middle = QHBoxLayout()
         self.book_list = QListWidget()
         self.book_list.setViewMode(QListView.ViewMode.IconMode)
         self.book_list.setIconSize(QSize(110, 150))
-        self.book_list.setGridSize(QSize(160, 215))
+        self.book_list.setGridSize(QSize(170, 240))
         self.book_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.book_list.setMovement(QListView.Movement.Static)
         self.book_list.setWordWrap(True)
         self.book_list.setSpacing(8)
-        self.book_list.itemDoubleClicked.connect(self._play_selected)
+        self.book_list.setUniformItemSizes(True)
+        self.book_list.itemDoubleClicked.connect(lambda item: self._open_book_item(item))
         self.book_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.book_list.customContextMenuRequested.connect(self._book_menu)
         self.chapter_list = QListWidget()
         self.chapter_list.itemDoubleClicked.connect(self._play_chapter_item)
-        self.chapter_list.setFixedWidth(300)
+        self.chapter_list.setMinimumWidth(300)
         middle.addWidget(self.book_list, 3)
         middle.addWidget(self.chapter_list, 2)
         root.addLayout(middle, 1)
 
-        # Now-playing label + Read PDF (opens the source PDF in the system
-        # browser, served locally with read-along sync).
         now_row = QHBoxLayout()
-        self.now_label = QLabel(tr("nothing_playing"))
-        self.btn_readalong = QPushButton(tr("readalong_toggle"))
-        self.btn_readalong.setToolTip(tr("readalong_toggle"))
+        self.now_label = QLabel()
+        self.now_label.setObjectName("nowPlayingLabel")
+        self.btn_readalong = QPushButton()
         self.btn_readalong.clicked.connect(self._open_read_pdf)
         now_row.addWidget(self.now_label, 1)
         now_row.addWidget(self.btn_readalong)
         root.addLayout(now_row)
 
-        # Player bar
         bar = QHBoxLayout()
-
-        def player_icon(name):
-            return QIcon(resource_path(os.path.join("assets", name)))
-
-        self.btn_prev = QPushButton(player_icon("prev.png"), "")
-        self.btn_prev.setToolTip(tr("prev"))
+        self.btn_prev = QPushButton(asset_icon("prev.png"), "")
         self.btn_prev.clicked.connect(lambda: self._skip(-1))
-        self.btn_play = QPushButton(player_icon("play.png"), tr("play"))
+        self.btn_play = QPushButton(asset_icon("play.png"), "")
         self.btn_play.clicked.connect(self._toggle_play)
-        self.btn_stop = QPushButton(player_icon("stop.png"), "")
-        self.btn_stop.setToolTip(tr("stop"))
-        self.btn_stop.clicked.connect(self._stop_playback)
-        self.btn_next = QPushButton(player_icon("next.png"), "")
-        self.btn_next.setToolTip(tr("next"))
+        self.btn_stop = QPushButton(asset_icon("stop.png"), "")
+        self.btn_stop.clicked.connect(lambda: self._stop_playback())
+        self.btn_next = QPushButton(asset_icon("next.png"), "")
         self.btn_next.clicked.connect(lambda: self._skip(1))
-        self.btn_repeat = QPushButton(player_icon("repeat_off.png"), "")
-        self.btn_repeat.setToolTip(tr("repeat_off"))
+        self.btn_repeat = QPushButton(asset_icon("repeat_off.png"), "")
         self.btn_repeat.clicked.connect(self._toggle_repeat)
-        self.btn_speed = QPushButton("1.0x")
-        self.btn_speed.setFixedWidth(56)
-        self.btn_speed.setToolTip("Playback speed (Ctrl+Up/Down)")
-        self.btn_speed.clicked.connect(lambda: self._cycle_speed(1))
-        for b in (
-            self.btn_prev,
-            self.btn_play,
-            self.btn_stop,
-            self.btn_next,
-            self.btn_repeat,
-        ):
+        self.btn_speed = QPushButton()
+        self.btn_speed.setFixedWidth(64)
+        self.speed_menu = QMenu(self)
+        self.btn_speed.setMenu(self.speed_menu)
+        for b in (self.btn_prev, self.btn_play, self.btn_stop, self.btn_next, self.btn_repeat):
             b.setIconSize(QSize(22, 22))
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = ClickSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
-        self.slider.sliderMoved.connect(self._seek)
         self.slider.sliderPressed.connect(self._slider_pressed)
+        self.slider.sliderMoved.connect(self._slider_moved)
         self.slider.sliderReleased.connect(self._slider_released)
         self.time_label = QLabel("00:00 / 00:00")
-        bar.addWidget(self.btn_prev)
-        bar.addWidget(self.btn_play)
-        bar.addWidget(self.btn_stop)
-        bar.addWidget(self.btn_next)
-        bar.addWidget(self.btn_repeat)
-        bar.addWidget(self.btn_speed)
+        for w in (self.btn_prev, self.btn_play, self.btn_stop, self.btn_next, self.btn_repeat, self.btn_speed):
+            bar.addWidget(w)
         bar.addWidget(self.slider, 1)
         bar.addWidget(self.time_label)
         root.addLayout(bar)
 
+        self.book_progress_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.book_progress_label)
         self.setCentralWidget(central)
+        self._update_speed_ui()
 
-    # ------------------------------------------------------------- library
+    def _build_menu(self):
+        mb = self.menuBar()
+        mb.clear()
+
+        m_file = mb.addMenu(tr("menu_file"))
+        act = m_file.addAction(tr("convert_btn"), lambda: self._start_conversion())
+        act.setShortcut(QKeySequence("Ctrl+O"))
+        m_file.addAction(tr("manage_voices"), self._manage_voices)
+        m_file.addAction(tr("open_dir_btn"), self._open_library_dir)
+        m_file.addSeparator()
+        act = m_file.addAction(tr("quit"), self.close)
+        act.setShortcut(QKeySequence("Ctrl+Q"))
+
+        m_play = mb.addMenu(tr("menu_playback"))
+        self._add_action(m_play, tr("play_pause"), self._toggle_play)
+        self._add_action(m_play, tr("stop"), lambda: self._stop_playback())
+        m_play.addSeparator()
+        self._add_action(m_play, tr("prev"), lambda: self._skip(-1), "Ctrl+Left")
+        self._add_action(m_play, tr("next"), lambda: self._skip(1), "Ctrl+Right")
+        self._add_action(m_play, tr("jump_back", seconds=JUMP_SECONDS), lambda: self._jump(-JUMP_SECONDS), "Alt+Left")
+        self._add_action(m_play, tr("jump_forward", seconds=JUMP_SECONDS), lambda: self._jump(JUMP_SECONDS), "Alt+Right")
+        m_play.addSeparator()
+        self._add_action(m_play, tr("speed_up"), lambda: self._step_speed(1), "Ctrl+Up")
+        self._add_action(m_play, tr("speed_down"), lambda: self._step_speed(-1), "Ctrl+Down")
+        self._add_action(m_play, tr("toggle_repeat"), self._toggle_repeat, "R")
+        m_play.addSeparator()
+        self._add_action(m_play, tr("add_bookmark"), self._add_bookmark, "Ctrl+B")
+        self._add_action(m_play, tr("show_bookmarks"), self._show_bookmarks, "Ctrl+Shift+B")
+        m_play.addSeparator()
+
+        self.sleep_menu = m_play.addMenu(tr("menu_sleep_timer"))
+        group = QActionGroup(self)
+        self._sleep_actions = {}
+        for minutes in (0, SLEEP_END_OF_TRACK, 15, 30, 45, 60, 90, 120):
+            if minutes == 0:
+                label = tr("sleep_off")
+            elif minutes == SLEEP_END_OF_TRACK:
+                label = tr("sleep_end_of_track")
+            else:
+                label = tr("sleep_minutes", minutes=minutes)
+            a = QAction(label, self, checkable=True)
+            a.setActionGroup(group)
+            a.triggered.connect(lambda _c, m=minutes: self._set_sleep_timer(m))
+            self.sleep_menu.addAction(a)
+            self._sleep_actions[minutes] = a
+        current = SLEEP_END_OF_TRACK if getattr(self, "_sleep_eot", False) else self._sleep_remaining_min
+        self._sleep_actions.get(current, self._sleep_actions[0]).setChecked(True)
+
+        if GlobalMediaKeys.supported():
+            m_play.addSeparator()
+            self._act_media = QAction(tr("global_media_keys"), self, checkable=True)
+            self._act_media.setChecked(self._media_keys is not None)
+            self._act_media.toggled.connect(self._set_global_media_keys)
+            m_play.addAction(self._act_media)
+
+        m_view = mb.addMenu(tr("menu_view"))
+        m_lang = m_view.addMenu(tr("menu_language"))
+        group = QActionGroup(self)
+        for code in SUPPORTED_LANGUAGES:
+            a = QAction(LANGUAGE_NAMES[code], self, checkable=True)
+            a.setActionGroup(group)
+            a.setChecked(code == get_language())
+            a.triggered.connect(lambda _c, c=code: self._switch_language(c))
+            m_lang.addAction(a)
+        m_theme = m_view.addMenu(tr("menu_theme"))
+        group = QActionGroup(self)
+        for mode, key in (("dark", "theme_dark"), ("light", "theme_light")):
+            a = QAction(tr(key), self, checkable=True)
+            a.setActionGroup(group)
+            a.setChecked(mode == self._theme_mode)
+            a.triggered.connect(lambda _c, m=mode: self._set_theme(m))
+            m_theme.addAction(a)
+
+        m_help = mb.addMenu(tr("menu_help"))
+        m_help.addAction(tr("check_updates"), lambda: self._check_updates(silent=False))
+        m_help.addAction(tr("open_logs"), self._open_logs)
+        m_help.addAction(tr("about"), self._about)
+
+    def _add_action(self, menu, text, slot, shortcut=None):
+        act = QAction(text, self)
+        if shortcut:
+            act.setShortcut(QKeySequence(shortcut))
+            act.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        act.triggered.connect(slot)
+        menu.addAction(act)
+        return act
+
+    def _build_shortcuts(self):
+        # Space is a QShortcut (not a menu shortcut) so it is not shown on the
+        # menu and lists keep their own keyboard behaviour elsewhere.
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._toggle_play)
+        for key, cmd in (
+            (Qt.Key.Key_MediaTogglePlayPause, "toggle"),
+            (Qt.Key.Key_MediaPlay, "toggle"),
+            (Qt.Key.Key_MediaPause, "toggle"),
+            (Qt.Key.Key_MediaNext, "next"),
+            (Qt.Key.Key_MediaPrevious, "prev"),
+            (Qt.Key.Key_MediaStop, "stop"),
+        ):
+            QShortcut(QKeySequence(key), self, activated=lambda c=cmd: self._media_command(c))
+
+    def _apply_ui_texts(self):
+        self.search_box.setPlaceholderText(tr("search_placeholder"))
+        self.btn_convert.setText(tr("convert_btn"))
+        self.btn_voices.setText(tr("manage_voices"))
+        self.btn_open_dir.setText(tr("open_dir_btn"))
+        self.btn_play.setToolTip(tr("play_pause") + " (Space)")
+        self.btn_stop.setToolTip(tr("stop"))
+        self.btn_prev.setToolTip(tr("prev") + " (Ctrl+Left)")
+        self.btn_next.setToolTip(tr("next") + " (Ctrl+Right)")
+        self.btn_speed.setToolTip(tr("speed_tooltip"))
+        self.btn_cancel.setText(tr("cancel"))
+        self.btn_pause.setText(tr("resume_conv") if self._conv_paused else tr("pause_conv"))
+        self.btn_readalong.setText(tr("readalong_toggle"))
+        self.btn_readalong.setToolTip(tr("readalong_tip"))
+        self._update_repeat_button()
+        self._update_speed_ui()
+        self._update_now_label()
+        self._update_statusbar()
+
+    def _set_progress_visible(self, visible):
+        for w in (self.progress_bar, self.progress_label, self.btn_pause, self.btn_cancel):
+            w.setVisible(visible)
+
+    # ------------------------------------------------------------ settings
+    def _set_theme(self, mode):
+        self._theme_mode = mode
+        self.settings.setValue("ui/theme", mode)
+        apply_theme(QApplication.instance(), mode)
+        self._update_repeat_button()
+
+    def _switch_language(self, code):
+        if code == get_language():
+            return
+        set_language(code)
+        self.settings.setValue("ui/language", code)
+        self._build_menu()
+        self._apply_ui_texts()
+        self._reload_books()
+        if self.current_book is not None:
+            self._fill_chapter_list()
+
+    def _set_sleep_timer(self, minutes):
+        self._sleep_eot = minutes == SLEEP_END_OF_TRACK
+        self._sleep_remaining_min = max(0, minutes)
+        self._sleep_timer.stop()
+        if minutes > 0:
+            self._sleep_timer.start(60 * 1000)
+        if minutes in self._sleep_actions:
+            self._sleep_actions[minutes].setChecked(True)
+        self._update_statusbar()
+
+    def _on_sleep_tick(self):
+        if not self.player.is_playing:
+            return  # the countdown only runs while something is playing
+        self._sleep_remaining_min -= 1
+        if self._sleep_remaining_min <= 0:
+            self._set_sleep_timer(0)
+            self._pause_playback()
+        self._update_statusbar()
+
+    def _set_global_media_keys(self, enabled):
+        if enabled and self._media_keys is None:
+            keys = GlobalMediaKeys(int(self.winId()), self._media_command)
+            if keys.register():
+                QApplication.instance().installNativeEventFilter(keys)
+                self._media_keys = keys
+            else:
+                QMessageBox.information(self, "PDF2Audiobook", tr("media_keys_failed"))
+                enabled = False
+        elif not enabled and self._media_keys is not None:
+            self._media_keys.unregister()
+            QApplication.instance().removeNativeEventFilter(self._media_keys)
+            self._media_keys = None
+        self.settings.setValue("player/global_media_keys", bool(enabled))
+        if hasattr(self, "_act_media"):
+            self._act_media.blockSignals(True)
+            self._act_media.setChecked(bool(enabled))
+            self._act_media.blockSignals(False)
+
+    def _media_command(self, cmd):
+        if cmd == "toggle":
+            self._toggle_play()
+        elif cmd == "next":
+            self._skip(1)
+        elif cmd == "prev":
+            self._skip(-1)
+        elif cmd == "stop":
+            self._stop_playback()
+
+    # ============================================================= library
+    def _book_dir(self, book):
+        d = book.get("book_dir") or ""
+        if not d:
+            chapters = self.db.get_chapters(book["id"])
+            if chapters:
+                d = os.path.dirname(chapters[0]["audio_path"])
+            elif book.get("cover_path"):
+                d = os.path.dirname(book["cover_path"])
+        return d
+
+    def _book_text(self, book):
+        author = book["author"] or tr("unknown_author")
+        lines = [book["title"], author]
+        converting = book["id"] in self._converting_ids()
+        if converting:
+            lines.append(tr("state_converting", count=book["chapter_count"]))
+        elif book["total_chapters"] == 0:
+            lines.append(tr("state_incomplete", count=book["chapter_count"]))
+        else:
+            total = book["total_duration"] or book.get("audio_duration") or 0
+            listened = self._listened_seconds(book)
+            pct = int(100 * listened / total) if total else 0
+            lines.append(tr("listened_progress", pos=fmt_duration(listened), total=fmt_duration(total), pct=pct))
+        return "\n".join(lines)
+
+    def _listened_seconds(self, book):
+        if self.current_book and self.current_book["id"] == book["id"] and self._chapter_offsets:
+            idx = min(book["current_chapter"], len(self._chapter_offsets) - 1)
+            return self._chapter_offsets[max(0, idx)] + book["position"]
+        # approximate from saved chapter index and an even split
+        n = book.get("chapter_count") or 0
+        total = book.get("audio_duration") or book.get("total_duration") or 0
+        if not n:
+            return 0.0
+        return min(total, total * book["current_chapter"] / n + book["position"])
+
+    def _book_tooltip(self, book):
+        parts = [book["title"], book["author"] or tr("unknown_author")]
+        if book.get("voice_model"):
+            parts.append(tr("voice_label", voice=voice_display_name(book["voice_model"])))
+        parts.append(tr("chunks", count=book["chapter_count"]))
+        if book.get("source_pdf"):
+            parts.append(book["source_pdf"])
+        return "\n".join(parts)
+
     def _reload_books(self):
+        selected = self._selected_book_id()
         self.book_list.clear()
         self._book_items = {}
         for book in self.db.list_books():
-            pos = fmt_duration(book["position"])
-            total = fmt_duration(book["total_duration"])
-            author = book["author"] or tr("unknown_author")
-            voice = (
-                tr("voice_label", voice=voice_display_name(book["voice_model"]))
-                if book.get("voice_model")
-                else ""
-            )
-            text = (
-                f"{book['title']}  ({author})\n"
-                f"{tr('chunks', count=book['chapter_count'])}  |  "
-                f"{tr('listened_progress', pos=pos, total=total)}"
-                + (f"\n{voice}" if voice else "")
-            )
-            item = QListWidgetItem(QIcon(self._book_cover(book)), text)
+            item = QListWidgetItem(self._book_icon(book), self._book_text(book))
             item.setData(Qt.ItemDataRole.UserRole, book["id"])
             item.setData(Qt.ItemDataRole.UserRole + 1, book)
-            item.setToolTip(
-                f"{book['title']}\n{author}\n{pos} / {total}"
-            )
+            item.setToolTip(self._book_tooltip(book))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
             self.book_list.addItem(item)
             self._book_items[book["id"]] = item
+            if book["id"] == selected:
+                self.book_list.setCurrentItem(item)
         self._apply_book_filter(self.search_box.text())
+        self._highlight_active_book()
         self._update_statusbar()
 
-    def _cover_font(self, point_size):
-        """Build a cover font with a guaranteed positive point size.
+    def _refresh_book_item(self, book_id):
+        """Update one gallery entry in place (no full rebuild)."""
+        item = self._book_items.get(book_id)
+        book = self.db.get_book(book_id)
+        if item is None or book is None:
+            self._reload_books()
+            return
+        item.setData(Qt.ItemDataRole.UserRole + 1, book)
+        item.setText(self._book_text(book))
+        item.setToolTip(self._book_tooltip(book))
+        item.setIcon(self._book_icon(book))
+        if self.current_book and self.current_book["id"] == book_id:
+            self.current_book = book
 
-        Qt reports pointSize() == -1 when the size was not explicitly set
-        (or the family cannot be resolved), and any size <= 0 makes
-        QPainter log ``QFont::setPointSize: Point size <= 0`` on every
-        cover render. Apply a positive fallback so drawing never hits that
-        warning. The fallback loop re-validates *after* each setPointSize
-        (some Qt versions defer the effective size until the family is
-        resolved, so a single probe can still read -1), and the last
-        resort switches to setPixelSize, which bypasses point metrics
-        entirely and can never trigger the warning.
-        """
-        size = point_size if point_size and point_size > 0 else 10
-        font = QFont("Segoe UI", size)
-        for candidate in (size, 10, 9):
-            font.setPointSize(candidate)
-            if font.pointSize() > 0:
-                return font
-        # Family could not be resolved to a point size at all; use pixel
-        # size so QPainter never receives a non-positive point size.
-        font.setPixelSize(max(12, int(size * 1.2)))
+    def _selected_book_id(self):
+        item = self.book_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _book_icon(self, book):
+        cover = book.get("cover_path")
+        key = (book["id"], cover, book["title"])
+        if cover and os.path.exists(cover):
+            key = key + (os.path.getmtime(cover),)
+        if key in self._cover_cache:
+            return self._cover_cache[key]
+        pm = None
+        if cover and os.path.exists(cover):
+            pm = QPixmap(cover)
+            if pm.isNull():
+                pm = None
+            else:
+                pm = pm.scaled(220, 300, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        if pm is None:
+            pm = self._placeholder_cover(book)
+        icon = QIcon(pm)
+        self._cover_cache[key] = icon
+        return icon
+
+    @staticmethod
+    def _cover_font(point_size):
+        font = QFont("Segoe UI")
+        font.setPixelSize(max(8, int(point_size * 1.33)))  # pixel size never warns
         return font
 
-    def _book_cover(self, book):
-        """Cover pixmap: real cover image if present, else a colored spine."""
-        cover = book.get("cover_path")
-        if cover and os.path.exists(cover):
-            try:
-                return QPixmap(cover)
-            except Exception:  # noqa: BLE001 - fall back to placeholder
-                pass
+    def _placeholder_cover(self, book):
         palette = [
-            ("#2e86ab", "#1b5570"),
-            ("#b5651d", "#7a4214"),
-            ("#6c5ce7", "#4a3f9e"),
-            ("#00b894", "#007a5e"),
-            ("#d63031", "#8f1f1f"),
-            ("#e17055", "#9c4a38"),
-            ("#0984e3", "#065e9e"),
-            ("#8e44ad", "#5e2d73"),
+            ("#2e86ab", "#1b5570"), ("#b5651d", "#7a4214"), ("#6c5ce7", "#4a3f9e"),
+            ("#00b894", "#007a5e"), ("#d63031", "#8f1f1f"), ("#e17055", "#9c4a38"),
+            ("#0984e3", "#065e9e"), ("#8e44ad", "#5e2d73"),
         ]
         color, edge = palette[book["id"] % len(palette)]
         pm = QPixmap(110, 150)
@@ -542,34 +656,30 @@ class MainWindow(QMainWindow):
         painter.drawRect(2, 36, 106, 6)
         title = book["title"] or "?"
         painter.setPen(QColor("#ffffff"))
-        first = title[:2] or "?"
-        font = self._cover_font(30)
+        font = self._cover_font(28)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(
-            QRect(6, 44, 98, 64),
-            Qt.AlignmentFlag.AlignCenter,
-            first,
-        )
-        font = self._cover_font(9)
-        painter.setFont(font)
-        painter.drawText(
-            QRect(6, 106, 98, 40),
-            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
-            title[:90],
-        )
+        painter.drawText(QRect(6, 44, 98, 64), Qt.AlignmentFlag.AlignCenter, title[:2] or "?")
+        painter.setFont(self._cover_font(9))
+        painter.drawText(QRect(6, 106, 98, 40),
+                         Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
+                         title[:90])
         painter.end()
         return pm
 
     def _apply_book_filter(self, text):
         query = text.strip().lower()
-        for book_id, item in self._book_items.items():
+        for item in self._book_items.values():
             book = item.data(Qt.ItemDataRole.UserRole + 1)
-            haystack = (
-                f"{book['title']} {book['author'] or ''} "
-                f"{book.get('voice_model') or ''}"
-            ).lower()
-            item.setHidden(bool(query) and query not in haystack)
+            hay = f"{book['title']} {book['author'] or ''} {book.get('voice_model') or ''}".lower()
+            item.setHidden(bool(query) and query not in hay)
+
+    def _highlight_active_book(self):
+        active = self.current_book["id"] if self.current_book else None
+        for bid, item in self._book_items.items():
+            item.setBackground(
+                QBrush(QColor(46, 204, 113, 70)) if bid == active else QBrush(Qt.GlobalColor.transparent)
+            )
 
     def _update_statusbar(self):
         parts = []
@@ -577,43 +687,273 @@ class MainWindow(QMainWindow):
             parts.append(tr("stat_books", count=len(self._book_items)))
         if self.repeat_mode != REPEAT_OFF:
             parts.append(tr(REPEAT_LABEL_KEYS[self.repeat_mode]))
-        if self._sleep_remaining_min > 0:
-            parts.append(
-                tr("sleep_minutes", minutes=self._sleep_remaining_min)
-            )
+        if getattr(self, "_sleep_eot", False):
+            parts.append(tr("sleep_end_of_track"))
+        elif self._sleep_remaining_min > 0:
+            parts.append(tr("sleep_left", minutes=self._sleep_remaining_min))
         self.statusBar().showMessage("  |  ".join(parts))
 
+    def _update_book_progress_label(self):
+        if self.current_book is None or self.current_chapter_idx < 0 or not self._chapter_offsets:
+            self.book_progress_label.setText("")
+            return
+        total = sum(c["duration"] for c in self.current_chapters)
+        done = self._chapter_offsets[self.current_chapter_idx] + self.player.position
+        left = max(0.0, total - done) / max(0.1, self.player.rate)
+        self.book_progress_label.setText(
+            tr("book_progress", pos=fmt_duration(done), total=fmt_duration(total),
+               left=fmt_duration(left), pct=int(100 * done / total) if total else 0)
+        )
+
+    # ---------------------------------------------------------- book menu
     def _book_menu(self, pos):
         item = self.book_list.itemAt(pos)
         if item is None:
             return
-        from PyQt6.QtWidgets import QMenu
-
-        menu = QMenu(self)
-        action = menu.addAction(tr("delete_from_library"))
-        chosen = menu.exec(self.book_list.mapToGlobal(pos))
-        if chosen is action:
-            book_id = item.data(Qt.ItemDataRole.UserRole)
-            self._delete_book(book_id)
-
-    def _delete_book(self, book_id):
-        box = QMessageBox(
-            QMessageBox.Icon.Question,
-            tr("delete_book_title"),
-            tr("delete_book_msg"),
-            QMessageBox.StandardButton.NoButton,
-            self,
-        )
-        yes_btn = box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
-        box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
-        box.exec()
-        if box.clickedButton() is not yes_btn:
+        book = self.db.get_book(item.data(Qt.ItemDataRole.UserRole))
+        if book is None:
             return
-        if self.current_book and self.current_book["id"] == book_id:
-            self._stop_playback()
-        self.db.delete_book(book_id)
+        converting = book["id"] in self._converting_ids()
+        menu = QMenu(self)
+        a_play = menu.addAction(tr("play"))
+        a_play.setEnabled(book["chapter_count"] > 0)
+        a_resume = None
+        if book["total_chapters"] == 0 and not converting:
+            a_resume = menu.addAction(tr("resume_conversion"))
+        a_read = menu.addAction(tr("readalong_toggle"))
+        a_export = menu.addAction(tr("export_m4b"))
+        a_export.setEnabled(book["total_chapters"] > 0)
+        a_realign = menu.addAction(tr("rebuild_readalong"))
+        a_realign.setEnabled(book["chapter_count"] > 0 and not converting)
+        menu.addSeparator()
+        a_edit = menu.addAction(tr("edit_details"))
+        a_folder = menu.addAction(tr("open_book_folder"))
+        menu.addSeparator()
+        a_delete = menu.addAction(tr("delete_from_library"))
+        a_delete.setEnabled(not converting)
+        chosen = menu.exec(self.book_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is a_play:
+            self._open_book(book)
+        elif a_resume is not None and chosen is a_resume:
+            self._resume_book(book)
+        elif chosen is a_read:
+            if not self.current_book or self.current_book["id"] != book["id"]:
+                self._open_book(book, autoplay=False)
+            self._open_read_pdf()
+        elif chosen is a_export:
+            self._export_book(book)
+        elif chosen is a_realign:
+            self._realign(book, then=None)
+        elif chosen is a_edit:
+            self._edit_book(book)
+        elif chosen is a_folder:
+            d = self._book_dir(book)
+            if d and os.path.isdir(d):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(d))
+        elif chosen is a_delete:
+            self._delete_book(book)
+
+    def _edit_book(self, book):
+        dlg = EditBookDialog(book, self)
+        if dlg.exec():
+            title, author = dlg.values()
+            self.db.update_book(book["id"], title=title or book["title"], author=author)
+            self._refresh_book_item(book["id"])
+            self._update_now_label()
+
+    def _delete_book(self, book):
+        if book["id"] in self._converting_ids():
+            QMessageBox.information(self, tr("delete_book_title"), tr("delete_busy"))
+            return
+        if not ask(self, tr("delete_book_title"), tr("delete_book_msg", title=book["title"]),
+                   QMessageBox.Icon.Warning):
+            return
+        if self.current_book and self.current_book["id"] == book["id"]:
+            self._stop_playback(save=False)
+            self.current_book = None
+            self.current_chapters = []
+            self.current_chapter_idx = -1
+            self.chapter_list.clear()
+            self._update_now_label()
+        book_dir = self._book_dir(book)
+        self.db.delete_book(book["id"])
+        if book_dir and os.path.isdir(book_dir):
+            try:
+                inside = os.path.commonpath([os.path.abspath(book_dir), os.path.abspath(BOOKS_DIR)]) \
+                    == os.path.abspath(BOOKS_DIR)
+            except ValueError:
+                inside = False
+            if inside:
+                shutil.rmtree(book_dir, ignore_errors=True)
         self._reload_books()
-        self.chapter_list.clear()
+
+    # =========================================================== conversion
+    def _ensure_voices(self):
+        if list_voice_models(MODELS_DIR):
+            return True
+        if ask(self, tr("model_missing_title"), tr("model_missing_ask")):
+            self._manage_voices()
+        return bool(list_voice_models(MODELS_DIR))
+
+    def _manage_voices(self):
+        VoiceManagerDialog(self, MODELS_DIR, CATALOG_CACHE).exec()
+
+    def _start_conversion(self, pdf_paths=None):
+        if not self._ensure_voices():
+            return
+        if not pdf_paths:
+            last_dir = str(self.settings.value("convert/last_dir", "") or "")
+            pdf_paths, _ = QFileDialog.getOpenFileNames(
+                self, tr("choose_pdfs"), last_dir, f"{tr('pdf_files')} (*.pdf)"
+            )
+            if not pdf_paths:
+                return
+            self.settings.setValue("convert/last_dir", os.path.dirname(pdf_paths[0]))
+        dlg = ConvertDialog(
+            self, pdf_paths, MODELS_DIR, self.settings,
+            preview_cb=self._preview_voice,
+            manage_voices_cb=self._manage_voices,
+            can_preview=not self._is_converting(),
+        )
+        if not dlg.exec():
+            self.preview_player.stop()
+            return
+        self.preview_player.stop()
+        self._enqueue(dlg.jobs())
+
+    def _enqueue(self, jobs):
+        new_worker = not self._is_converting()
+        if new_worker:
+            self.worker = QueueWorker(BOOKS_DIR, DB_PATH, self)
+            self.worker.progress.connect(self._on_progress)
+            self.worker.job_started.connect(self._on_job_started)
+            self.worker.book_created.connect(self._on_book_created)
+            self.worker.job_done.connect(self._on_convert_done)
+            self.worker.job_failed.connect(self._on_convert_failed)
+            self.worker.all_done.connect(self._on_convert_all_done)
+            self.worker.paused_changed.connect(self._on_conv_paused_changed)
+            self._conv_failures = []
+        for job in jobs:
+            self.worker.add_job(
+                job["pdf_path"], job["model_path"], job["config_path"], job["title"],
+                job["author"], job["voice_model"], job["length_scale"],
+                job.get("audio_format", "mp3"), job.get("options"), job.get("book_id"),
+            )
+        if new_worker:
+            self._conv_paused = False
+            self.btn_pause.setText(tr("pause_conv"))
+            self.btn_cancel.setEnabled(True)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText(tr("extracting"))
+            self._set_progress_visible(True)
+            self.worker.start()
+        else:
+            self.statusBar().showMessage(tr("queued_jobs", count=len(jobs)), 4000)
+
+    def _resume_book(self, book):
+        model_path = os.path.join(MODELS_DIR, f"{book['voice_model']}.onnx")
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, tr("failed_title"), tr("model_not_found", path=model_path))
+            return
+        if not os.path.exists(book.get("source_pdf") or ""):
+            QMessageBox.warning(self, tr("failed_title"), tr("pdf_not_found", path=book.get("source_pdf")))
+            return
+        try:
+            options = json.loads(book.get("options") or "{}") or {}
+        except ValueError:
+            options = {}
+        config = model_path + ".json"
+        self._enqueue([{
+            "pdf_path": book["source_pdf"], "model_path": model_path,
+            "config_path": config if os.path.exists(config) else None,
+            "title": book["title"], "author": book["author"], "voice_model": book["voice_model"],
+            "length_scale": book.get("rate") or 1.0,
+            "audio_format": book.get("audio_format") or "wav",
+            "options": options, "book_id": book["id"],
+        }])
+
+    def _on_job_started(self, index, total, title):
+        self._job_prefix = tr("queue_progress", current=index, total=total, title=title)
+        self.progress_label.setText(self._job_prefix)
+
+    def _on_progress(self, percent, message):
+        self.progress_bar.setValue(percent)
+        self.progress_label.setText(f"{self._job_prefix}  —  {message}" if self._job_prefix else message)
+
+    def _on_book_created(self, book_id):
+        if book_id in self._book_items:
+            self._refresh_book_item(book_id)
+        else:
+            self._reload_books()
+
+    def _on_convert_done(self, book_id, title):
+        self._refresh_book_item(book_id)
+        if self.current_book and self.current_book["id"] == book_id:
+            self._load_chapters(self.db.get_book(book_id))
+
+    def _on_convert_failed(self, message, title):
+        logging.warning("Conversion failed for %s: %s", title, message)
+        self._conv_failures.append((title, message))
+
+    def _on_convert_all_done(self, done, failed, cancelled):
+        self._set_progress_visible(False)
+        self.worker = None
+        self._job_prefix = ""
+        self._reload_books()
+        if cancelled:
+            msg = tr("summary_cancelled", done=done)
+        elif failed:
+            msg = tr("summary_failed", done=done, failed=failed)
+        else:
+            msg = tr("summary_done", done=done)
+        if self._conv_failures:
+            msg += "\n\n" + "\n".join(f"• {t}: {m}" for t, m in self._conv_failures)
+        icon = QMessageBox.Icon.Warning if failed else QMessageBox.Icon.Information
+        QMessageBox(icon, tr("done_title"), msg, QMessageBox.StandardButton.Ok, self).exec()
+
+    def _toggle_conv_pause(self):
+        if self.worker is not None:
+            self.worker.set_paused(not self._conv_paused)
+
+    def _on_conv_paused_changed(self, paused):
+        self._conv_paused = paused
+        self.btn_pause.setText(tr("resume_conv") if paused else tr("pause_conv"))
+
+    def _cancel_conversion(self):
+        if self.worker is None:
+            return
+        self.worker.cancel()
+        self.btn_cancel.setEnabled(False)
+        self.progress_label.setText(tr("cancelling"))
+
+    def _preview_voice(self, model_path, config_path, voice_model, speed):
+        if self._is_converting():
+            return
+        if self.player.is_playing:
+            self._pause_playback()
+        tts = self._tts_preview_cache.get(model_path)
+        if tts is None:
+            tts = PiperTTS(model_path, config_path)
+            self._tts_preview_cache = {model_path: tts}
+        text = preview_text(voice_model)
+
+        def job(_p, cancel):
+            samples = tts.synthesize(text, length_scale=1.0 / float(speed or 1.0), cancel_event=cancel)
+            return samples, tts.sample_rate
+
+        self.statusBar().showMessage(tr("preview_loading"), 5000)
+        self._run_task(
+            job,
+            on_success=lambda r: self.preview_player.play_array(r[0].astype("float32") / 32768.0, r[1]),
+        )
+
+    # ============================================================ playback
+    def _open_book_item(self, item):
+        book = self.db.get_book(item.data(Qt.ItemDataRole.UserRole))
+        if book:
+            self._open_book(book)
 
     def _load_chapters(self, book):
         self.current_book = book
@@ -623,299 +963,141 @@ class MainWindow(QMainWindow):
         for ch in self.current_chapters:
             self._chapter_offsets.append(acc)
             acc += ch["duration"]
+        self._fill_chapter_list()
+        if self._read_server is not None:
+            self._push_book_to_reader()
+
+    def _fill_chapter_list(self):
         self.chapter_list.clear()
         for ch in self.current_chapters:
-            item = QListWidgetItem(
-                f"{ch['idx'] + 1:02d}  {ch['title']}  ({fmt_duration(ch['duration'])})"
-            )
+            item = QListWidgetItem(f"{ch['idx'] + 1:02d}  {ch['title']}  ({fmt_duration(ch['duration'])})")
             item.setData(Qt.ItemDataRole.UserRole, ch["idx"])
+            item.setToolTip(ch["title"])
             self.chapter_list.addItem(item)
+        if 0 <= self.current_chapter_idx < self.chapter_list.count():
+            self.chapter_list.setCurrentRow(self.current_chapter_idx)
 
-    # --------------------------------------------------------- conversion
-    def _start_conversion(self):
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(self, tr("busy_title"), tr("busy_msg"))
+    def _open_book(self, book, autoplay=True):
+        same_book = self.current_book is not None and self.current_book["id"] == book["id"]
+        if same_book and self.player.is_loaded:
+            # Re-opening the book that is already loaded: just keep listening.
+            if autoplay and self.player.is_paused:
+                self.player.resume()
+                self._save_timer.start()
+                self._update_now_label()
             return
-
-        models = list_voice_models(MODELS_DIR)
-        if not models:
-            QMessageBox.warning(
-                self,
-                tr("model_missing_title"),
-                tr("model_missing_msg", dir=MODELS_DIR),
-            )
-            return
-
-        pdf_paths, _ = QFileDialog.getOpenFileNames(
-            self, tr("choose_pdfs"), "", f"{tr('pdf_files')} (*.pdf)"
-        )
-        if not pdf_paths:
-            return
-
-        base_title = os.path.splitext(os.path.basename(pdf_paths[0]))[0]
-        title, ok = QInputDialog.getText(
-            self,
-            tr("book_title_dlg"),
-            tr("title_label"),
-            QLineEdit.EchoMode.Normal,
-            base_title,
-        )
-        if not ok:
-            return
-        author, ok = QInputDialog.getText(
-            self, tr("author_dlg"), tr("author_label"), QLineEdit.EchoMode.Normal, ""
-        )
-        if not ok:
-            return
-
-        names = [entry[2] for entry in models]
-        choice, ok = QInputDialog.getItem(
-            self, tr("choose_voice_dlg"), tr("voice_model_label"), names, 0, False
-        )
-        if not ok:
-            return
-        model_path, config_path, _ = next(e for e in models if e[2] == choice)
-        voice_model = os.path.splitext(os.path.basename(model_path))[0]
-
-        speeds = ["0.8x", "0.9x", "1.0x", "1.1x", "1.2x", "1.3x"]
-        speed_choice, ok = QInputDialog.getItem(
-            self, tr("speed_dlg"), tr("speed_dlg"), speeds, 2, False
-        )
-        if not ok:
-            return
-        length_scale = float(speed_choice[:-1])
-
-        self.worker = QueueWorker(BOOKS_DIR, DB_PATH, self)
-        clean_title = title.strip() or base_title
-        for i, pdf in enumerate(pdf_paths):
-            book_title = clean_title
-            if len(pdf_paths) > 1 and i > 0:
-                book_title = f"{clean_title} ({i + 1})"
-            self.worker.add_job(
-                pdf,
-                model_path,
-                config_path,
-                book_title,
-                author.strip(),
-                voice_model,
-                length_scale,
-            )
-        self.worker.progress.connect(self._on_progress)
-        self.worker.job_done.connect(self._on_convert_done)
-        self.worker.job_failed.connect(self._on_convert_failed)
-        self.worker.all_done.connect(self._on_convert_all_done)
-        self.worker.paused_changed.connect(self._on_conv_paused_changed)
-        self._conv_paused = False
-        self.progress_bar.setVisible(True)
-        self.progress_label.setVisible(True)
-        self.btn_pause.setVisible(True)
-        self.btn_cancel.setVisible(True)
-        self.btn_cancel.setEnabled(True)
-        self.progress_bar.setValue(0)
-        self.progress_label.setText(tr("extracting"))
-        self.worker.start()
-
-    def _on_progress(self, percent, message):
-        self.progress_bar.setValue(percent)
-        self.progress_label.setText(message)
-
-    def _on_convert_done(self, book_id, title):
-        self._reload_books()
-
-    def _on_convert_all_done(self):
-        self.progress_bar.setVisible(False)
-        self.progress_label.setVisible(False)
-        self.btn_pause.setVisible(False)
-        self.btn_cancel.setVisible(False)
-        self._reload_books()
-        self.worker = None
-        QMessageBox.information(self, tr("done_title"), tr("done"))
-
-    def _on_convert_failed(self, message, title):
-        # A failed job used to only update the label: with the progress bar
-        # still visible the UI looked like a frozen 8%, and the real error
-        # was easy to miss. Surface it as a dialog and restore the controls
-        # so the user knows the conversion actually ended.
-        self.progress_label.setText(f"{title}: {message}")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        self.progress_label.setVisible(False)
-        self.btn_pause.setVisible(False)
-        self.btn_cancel.setVisible(False)
-        QMessageBox.warning(
-            self,
-            tr("failed_title"),
-            f"{title}: {message}",
-        )
-
-    def _toggle_conv_pause(self):
-        if self.worker is None:
-            return
-        paused = not self._conv_paused
-        self.worker.set_paused(paused)
-        self.btn_pause.setText(
-            tr("resume_conv") if paused else tr("pause_conv")
-        )
-
-    def _on_conv_paused_changed(self, paused):
-        self._conv_paused = paused
-        self.btn_pause.setText(
-            tr("resume_conv") if paused else tr("pause_conv")
-        )
-
-    def _cancel_conversion(self):
-        if self.worker is None:
-            return
-        self.worker.cancel()
-        self.btn_cancel.setEnabled(False)
-
-    # ---------------------------------------------------------- playback
-    def _play_selected(self):
-        item = self.book_list.currentItem()
-        if item is None:
-            return
-        book = item.data(Qt.ItemDataRole.UserRole + 1)
+        if self.current_book and not same_book:
+            self._save_progress()
+            self._stop_playback(save=False)
         self._load_chapters(book)
-        start_idx = book["current_chapter"]
-        start_pos = book["position"] if start_idx < len(self.current_chapters) else 0.0
-        self._play_chapter(start_idx, start_pos)
-
-    def _play_chapter_item(self):
-        item = self.chapter_list.currentItem()
-        if item is None:
+        if not self.current_chapters:
+            QMessageBox.information(self, "PDF2Audiobook", tr("no_audio_yet"))
             return
-        idx = item.data(Qt.ItemDataRole.UserRole)
-        self._play_chapter(idx, 0.0)
-
-    def _play_chapter(self, idx, position=0.0):
-        if self.current_book is None or not self.current_chapters:
-            return
-        if idx < 0 or idx >= len(self.current_chapters):
-            return
+        idx = book["current_chapter"] if book["current_chapter"] < len(self.current_chapters) else 0
+        pos = book["position"] if idx == book["current_chapter"] else 0.0
         self.current_chapter_idx = idx
-        ch = self.current_chapters[idx]
-        item = self.chapter_list.item(idx)
-        if item is not None:
+        self._resume_pos = pos
+        self._highlight_active_book()
+        if autoplay:
+            self._play_chapter(idx, pos)
+        else:
             self.chapter_list.setCurrentRow(idx)
-            self.chapter_list.scrollToItem(item)
-        try:
-            self.player.play(ch["audio_path"], position=position)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("playback_error_title"), str(exc))
+            self._update_now_label()
+
+    def _play_chapter_item(self, item):
+        if item is not None:
+            self._play_chapter(item.data(Qt.ItemDataRole.UserRole), 0.0)
+
+    def _row_for_idx(self, idx):
+        for i, ch in enumerate(self.current_chapters):
+            if ch["idx"] == idx:
+                return i
+        return -1
+
+    def _play_chapter(self, row, position=0.0):
+        if self.current_book is None or not (0 <= row < len(self.current_chapters)):
             return
+        ch = self.current_chapters[row]
+        same = (
+            row == self.current_chapter_idx
+            and self.player.is_loaded
+            and self.player.current_path == ch["audio_path"]
+        )
+        try:
+            if same:
+                self.player.seek(position)
+                if self.player.is_paused:
+                    self.player.resume()
+            else:
+                self.player.play(ch["audio_path"], position=position)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("playback failed")
+            QMessageBox.warning(self, tr("playback_error_title"), f"{exc}")
+            return
+        self.current_chapter_idx = row
+        self.chapter_list.setCurrentRow(row)
+        item = self.chapter_list.item(row)
+        if item is not None:
+            self.chapter_list.scrollToItem(item)
         self._save_timer.start()
         self._highlight_active_book()
         self._update_now_label()
 
-    def _highlight_active_book(self):
-        if self.current_book is None:
-            return
-        for bid, item in self._book_items.items():
-            item.setBackground(QBrush(Qt.GlobalColor.transparent))
-        item = self._book_items.get(self.current_book["id"])
-        if item is not None:
-            item.setBackground(QBrush(QColor(46, 204, 113, 70)))
-
     def _toggle_play(self):
-        if self.current_chapter_idx < 0:
-            self._play_selected()
+        if self.current_book is None:
+            item = self.book_list.currentItem()
+            if item is not None:
+                self._open_book_item(item)
             return
         if self.player.is_playing:
-            self.player.pause()
-        elif self.player.current_path is not None:
+            self._pause_playback()
+        elif self.player.is_paused:
             self.player.resume()
-        else:
-            self._play_chapter(self.current_chapter_idx)
+            self._save_timer.start()
+        elif self.current_chapter_idx >= 0:
+            self._play_chapter(self.current_chapter_idx, self._resume_pos)
         self._update_now_label()
 
-    # ------------------------------------------------------ read PDF (browser)
-    def _open_read_pdf(self):
-        """Open the current book's source PDF in the system browser.
+    def _pause_playback(self):
+        self.player.pause()
+        self._save_progress()
+        self._update_now_label()
 
-        A local HTTP server (browser_pdf.ReadAlongServer) serves the PDF,
-        the sentence-alignment data and a tiny playback-state snapshot.
-        The browser page renders the PDF with PDF.js and keeps
-        auto-scroll / word-highlight / click-to-seek in sync.
-        """
-        if self.current_book is None:
-            QMessageBox.information(
-                self, tr("readalong_toggle"), tr("readalong_no_data")
-            )
-            return
-        alignments = self.db.get_sentence_alignments(self.current_book["id"])
-        if self._read_server is None:
-            server = ReadAlongServer()
-            server.set_seek_callback(self._readalong_seek)
-            server.start()
-            self._read_server = server
-        self._read_server.set_book(
-            self.current_book.get("source_pdf"),
-            alignments,
-            self._chapter_offsets,
-            get_language(),
-        )
-        url = self._read_server.url
-        if url:
-            webbrowser.open(url)
-        self._sync_readalong()
-
-    def _sync_readalong(self):
-        """Push the current playback position to the browser page."""
-        if self._read_server is None:
-            return
-        if self.current_chapter_idx < 0 or self.current_book is None:
-            self._read_server.update_state(-1, 0.0, False, self.player.rate)
-            return
-        offset = (
-            self._chapter_offsets[self.current_chapter_idx]
-            if self.current_chapter_idx < len(self._chapter_offsets)
-            else 0.0
-        )
-        self._read_server.update_state(
-            self.current_chapter_idx,
-            offset + self.player.position,
-            self.player.is_playing,
-            self.player.rate,
-        )
-
-    def _readalong_seek(self, audio_start, chapter_idx=None):
-        """Queue a browser reader seek; drained on the UI tick.
-
-        Runs on an HTTP worker thread, so it only appends to a thread-safe
-        queue and lets _tick perform the actual playback restart on the main
-        thread. chapter_idx defaults to the currently playing chapter, which
-        keeps old clients (no chapter_idx in the POST body) working.
-        """
-        if self.current_chapter_idx < 0:
-            return
-        self._seek_requests.append((float(audio_start), chapter_idx))
-
-    def _drain_seek_requests(self):
-        """Apply queued browser seeks (main thread, serialized)."""
-        if not self._seek_requests:
-            return
-        audio_start, chapter_idx = self._seek_requests.pop(0)
-        self._seek_requests.clear()
-        if chapter_idx is None or not (
-            0 <= chapter_idx < len(self.current_chapters)
-        ):
-            chapter_idx = self.current_chapter_idx
-        if chapter_idx < 0:
-            return
-        offset = (
-            self._chapter_offsets[chapter_idx]
-            if chapter_idx < len(self._chapter_offsets)
-            else 0.0
-        )
-        target = max(0.0, audio_start - offset)
-        self._play_chapter(chapter_idx, target)
-
-    def _stop_playback(self):
+    def _stop_playback(self, save=True):
+        if save:
+            self._save_progress()
+        if self.player.is_loaded:
+            self._resume_pos = self.player.position
         self.player.stop()
         self._save_timer.stop()
-        self.now_label.setText(tr("nothing_playing"))
         self.slider.setValue(0)
         self.time_label.setText("00:00 / 00:00")
+        self._update_now_label()
+
+    def _skip(self, delta):
+        if self.current_book is None:
+            return
+        if delta < 0 and self.player.is_loaded and self.player.position > 3.0:
+            self._play_chapter(self.current_chapter_idx, 0.0)  # restart current track first
+            return
+        nxt = self.current_chapter_idx + delta
+        if 0 <= nxt < len(self.current_chapters):
+            self._play_chapter(nxt, 0.0)
+        elif delta < 0 and self.current_chapter_idx == 0:
+            self._play_chapter(0, 0.0)
+
+    def _jump(self, seconds):
+        if self.current_book is None or self.current_chapter_idx < 0:
+            return
+        row = self.current_chapter_idx
+        pos = (self.player.position if self.player.is_loaded else self._resume_pos) + seconds
+        if pos < 0 and row > 0:
+            prev = self.current_chapters[row - 1]
+            self._play_chapter(row - 1, max(0.0, prev["duration"] + pos))
+        elif pos >= self.current_chapters[row]["duration"] and row < len(self.current_chapters) - 1:
+            self._play_chapter(row + 1, pos - self.current_chapters[row]["duration"])
+        else:
+            self._play_chapter(row, min(max(0.0, pos), self.current_chapters[row]["duration"] - 0.5))
 
     def _toggle_repeat(self):
         self.repeat_mode = (self.repeat_mode + 1) % 3
@@ -923,260 +1105,347 @@ class MainWindow(QMainWindow):
         self._update_statusbar()
 
     def _update_repeat_button(self):
-        icon_name = REPEAT_ICON_FILES[self.repeat_mode]
+        name = REPEAT_ICON_FILES[self.repeat_mode]
         if self.repeat_mode == REPEAT_ONE and self._theme_mode == "light":
-            # repeat_one_light uses a dark "1" so it stays visible on light
-            # backgrounds; the dark-theme icon uses a white "1".
-            icon_name = "repeat_one_light.png"
-        self.btn_repeat.setIcon(
-            QIcon(resource_path(os.path.join("assets", icon_name)))
-        )
-        self.btn_repeat.setToolTip(tr(REPEAT_LABEL_KEYS[self.repeat_mode]))
+            name = "repeat_one_light.png"
+        self.btn_repeat.setIcon(asset_icon(name))
+        self.btn_repeat.setToolTip(tr(REPEAT_LABEL_KEYS[self.repeat_mode]) + " (R)")
 
-    SPEEDS = [0.75, 1.0, 1.25, 1.5, 2.0]
+    # ------------------------------------------------------------- speed
+    def _update_speed_ui(self):
+        rate = self.player.rate
+        self.btn_speed.setText(f"{rate:g}x")
+        self.speed_menu.clear()
+        group = QActionGroup(self.speed_menu)
+        for s in PLAYBACK_SPEEDS:
+            a = QAction(f"{s:g}x", self.speed_menu, checkable=True)
+            a.setActionGroup(group)
+            a.setChecked(abs(s - rate) < 1e-6)
+            a.triggered.connect(lambda _c, v=s: self._set_speed(v))
+            self.speed_menu.addAction(a)
 
-    def _cycle_speed(self, delta):
-        cur = 1
-        try:
-            cur = self.SPEEDS.index(round(self.player.rate, 2))
-        except ValueError:
-            pass
-        nxt = (cur + delta) % len(self.SPEEDS)
-        rate = self.SPEEDS[nxt]
+    def _set_speed(self, rate):
         try:
             self.player.set_rate(rate)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, tr("playback_error_title"), str(exc))
             return
-        self.btn_speed.setText(f"{rate:g}x")
-        self._update_now_label()
+        self.settings.setValue("player/rate", rate)
+        self._update_speed_ui()
+        self.statusBar().showMessage(tr("speed_now", rate=f"{rate:g}"), 2000)
+
+    def _step_speed(self, delta):
+        rate = self.player.rate
+        idx = min(range(len(PLAYBACK_SPEEDS)), key=lambda i: abs(PLAYBACK_SPEEDS[i] - rate))
+        idx = max(0, min(len(PLAYBACK_SPEEDS) - 1, idx + delta))
+        self._set_speed(PLAYBACK_SPEEDS[idx])
+
+    # ------------------------------------------------------------ slider
+    def _slider_pressed(self):
+        self._slider_dragging = True
+
+    def _slider_moved(self, value):
+        if 0 <= self.current_chapter_idx < len(self.current_chapters):
+            dur = self.current_chapters[self.current_chapter_idx]["duration"]
+            self.time_label.setText(f"{fmt_duration(value / 1000 * dur)} / {fmt_duration(dur)}")
+
+    def _slider_released(self):
+        self._slider_dragging = False
+        if not (0 <= self.current_chapter_idx < len(self.current_chapters)):
+            return
+        dur = self.current_chapters[self.current_chapter_idx]["duration"]
+        if dur > 0:
+            self._play_chapter(self.current_chapter_idx, self.slider.value() / 1000.0 * dur)
+
+    # ------------------------------------------------------------- ticker
+    def _tick(self):
+        self._drain_commands()
+        if self.current_book is None or not (0 <= self.current_chapter_idx < len(self.current_chapters)):
+            return
+        ch = self.current_chapters[self.current_chapter_idx]
+        pos = self.player.position if self.player.is_loaded else self._resume_pos
+        if ch["duration"] > 0 and not self._slider_dragging:
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(min(1.0, pos / ch["duration"]) * 1000))
+            self.slider.blockSignals(False)
+        if not self._slider_dragging:
+            self.time_label.setText(f"{fmt_duration(pos)} / {fmt_duration(ch['duration'])}")
+        self._sync_readalong()
+        self._update_book_progress_label()
+        if self.player.is_finished:
+            self._on_track_finished()
+
+    def _on_track_finished(self):
+        if getattr(self, "_sleep_eot", False):
+            self._set_sleep_timer(0)
+            self._resume_pos = 0.0
+            nxt = self.current_chapter_idx + 1
+            self._stop_playback(save=False)
+            if nxt < len(self.current_chapters):
+                self.current_chapter_idx = nxt
+            self._save_progress(position=0.0)
+            return
+        if self.repeat_mode == REPEAT_ONE:
+            self._play_chapter(self.current_chapter_idx, 0.0)
+        elif self.current_chapter_idx < len(self.current_chapters) - 1:
+            self._play_chapter(self.current_chapter_idx + 1, 0.0)
+        elif self.repeat_mode == REPEAT_ALL:
+            self._play_chapter(0, 0.0)
+        else:  # book finished: next time start from the beginning
+            self.player.stop()
+            self._save_timer.stop()
+            self.current_chapter_idx = 0
+            self._resume_pos = 0.0
+            self.db.update_progress(self.current_book["id"], 0, 0.0)
+            self._refresh_book_item(self.current_book["id"])
+            self._update_now_label()
+            self.statusBar().showMessage(tr("book_finished", title=self.current_book["title"]), 8000)
+
+    def _save_progress(self, position=None):
+        if self.current_book is None or self.current_chapter_idx < 0:
+            return
+        if position is None:
+            position = self.player.position if self.player.is_loaded else self._resume_pos
+        self.db.update_progress(self.current_book["id"], self.current_chapter_idx, position)
+        self._refresh_book_item(self.current_book["id"])
+
+    def _update_now_label(self):
+        playing = self.player.is_playing
+        self.btn_play.setIcon(asset_icon("pause.png" if playing else "play.png"))
+        if self.current_book is None or not (0 <= self.current_chapter_idx < len(self.current_chapters)):
+            self.now_label.setText(tr("nothing_playing"))
+            return
+        ch = self.current_chapters[self.current_chapter_idx]
+        state = tr("state_playing") if playing else tr("state_paused")
+        self.now_label.setText(tr("now_playing", title=self.current_book["title"], chapter=ch["title"], state=state))
 
     # ---------------------------------------------------------- bookmarks
     def _add_bookmark(self):
         if self.current_book is None or self.current_chapter_idx < 0:
             return
         ch = self.current_chapters[self.current_chapter_idx]
-        pos = self.player.position
-        self.db.add_bookmark(
-            self.current_book["id"],
-            self.current_chapter_idx,
-            pos,
-            f"{ch['title']} @ {fmt_duration(pos)}",
-        )
-        self._update_bookmarks_menu()
-        QMessageBox.information(self, tr("bookmarks_menu"), tr("bookmark_added"))
-
-    def _update_bookmarks_menu(self):
-        marks = self.db.list_bookmarks(self.current_book["id"]) if self.current_book else []
-        text = tr("no_bookmarks") if not marks else tr("bookmarks_menu")
-        self._bookmarks_list_action.setText(text)
+        pos = self.player.position if self.player.is_loaded else self._resume_pos
+        self.db.add_bookmark(self.current_book["id"], ch["idx"], pos, ch["title"])
+        self.statusBar().showMessage(tr("bookmark_added_at", title=ch["title"], pos=fmt_duration(pos)), 4000)
 
     def _show_bookmarks(self):
         if self.current_book is None:
+            QMessageBox.information(self, tr("bookmarks_menu"), tr("open_book_first"))
             return
         marks = self.db.list_bookmarks(self.current_book["id"])
         if not marks:
             QMessageBox.information(self, tr("bookmarks_menu"), tr("no_bookmarks"))
             return
-        dlg = BookmarkDialog(marks, self)
+        dlg = BookmarkDialog(marks, self.db, self.current_chapters, self)
         if dlg.exec() and dlg.chosen is not None:
             idx, pos = dlg.chosen
-            self._play_chapter(idx, pos)
+            row = self._row_for_idx(idx)
+            if row >= 0:
+                self._play_chapter(row, pos)
 
-    def _skip(self, delta):
-        if self.current_book is None:
+    # ======================================================= read along
+    def _open_read_pdf(self):
+        book = self.current_book
+        if book is None:
+            item = self.book_list.currentItem()
+            if item is None:
+                QMessageBox.information(self, tr("readalong_toggle"), tr("open_book_first"))
+                return
+            book = self.db.get_book(item.data(Qt.ItemDataRole.UserRole))
+            self._open_book(book, autoplay=False)
+            book = self.current_book
+            if book is None:
+                return
+        pdf = book.get("source_pdf") or ""
+        if not os.path.exists(pdf):
+            if not ask(self, tr("readalong_toggle"), tr("pdf_missing_locate", path=pdf or "?")):
+                return
+            new_pdf, _ = QFileDialog.getOpenFileName(self, tr("choose_pdfs"), "", f"{tr('pdf_files')} (*.pdf)")
+            if not new_pdf:
+                return
+            self.db.update_book(book["id"], source_pdf=new_pdf)
+            self.current_book = book = self.db.get_book(book["id"])
+        alignments = self.db.get_sentence_alignments(book["id"])
+        if needs_realign(alignments):
+            self._realign(book, then=self._open_read_pdf)
             return
-        nxt = self.current_chapter_idx + delta
-        if 0 <= nxt < len(self.current_chapters):
-            self._play_chapter(nxt, 0.0)
-        elif delta > 0 and self.current_chapter_idx == len(self.current_chapters) - 1:
-            self._stop_playback()
-
-    def _seek(self, value):
-        if self.current_chapter_idx < 0:
-            return
-        ch = self.current_chapters[self.current_chapter_idx]
-        if ch["duration"] <= 0:
-            return
-        target = (value / 1000.0) * ch["duration"]
-        self._play_chapter(self.current_chapter_idx, target)
-
-    def _slider_pressed(self):
-        # User grabbed the handle or clicked the track: pause ticker sync so
-        # the 500 ms UI timer cannot overwrite the slider before release.
-        self._slider_guard = True
-
-    def _slider_released(self):
-        # Fired for both dragging (after sliderMoved) and a plain track click.
-        # On a plain click the slider jumps to the clicked value without any
-        # sliderMoved emission, so seeking on release covers that case.
-        self._slider_guard = False
-        self._seek(self.slider.value())
-
-    def _tick(self):
-        if self.current_chapter_idx < 0 or self.current_book is None:
-            return
-        self._drain_seek_requests()
-        ch = self.current_chapters[self.current_chapter_idx]
-        pos = self.player.position
-        if ch["duration"] > 0 and not self._slider_guard:
-            self._slider_guard = True
-            self.slider.setValue(int((pos / ch["duration"]) * 1000))
-            self._slider_guard = False
-        self.time_label.setText(f"{fmt_duration(pos)} / {fmt_duration(ch['duration'])}")
+        if self._read_server is None:
+            server = ReadAlongServer()
+            server.set_seek_callback(lambda t, idx: self._commands.append(("seek", t, idx)))
+            server.set_control_callback(lambda a: self._commands.append(("control", a, None)))
+            server.start()
+            self._read_server = server
+        self._push_book_to_reader(alignments)
+        if self._read_server.url:
+            webbrowser.open(self._read_server.url)
         self._sync_readalong()
-        # Auto-advance when a chapter finishes (never while paused).
-        if (
-            not self.player.is_playing
-            and not self.player.is_paused
-            and self.player.current_path is not None
-        ):
-            if self.repeat_mode == REPEAT_ONE:
-                self._play_chapter(self.current_chapter_idx, 0.0)
-            elif self.current_chapter_idx < len(self.current_chapters) - 1:
-                self._play_chapter(self.current_chapter_idx + 1, 0.0)
-            elif self.repeat_mode == REPEAT_ALL:
-                self._play_chapter(0, 0.0)
-            else:
-                self._stop_playback()
-                self._reload_books()
 
-    def _save_progress(self):
-        if self.current_book is None or self.current_chapter_idx < 0:
+    def _push_book_to_reader(self, alignments=None):
+        if self._read_server is None or self.current_book is None:
             return
-        self.db.update_progress(
-            self.current_book["id"], self.current_chapter_idx, self.player.position
+        if alignments is None:
+            alignments = self.db.get_sentence_alignments(self.current_book["id"])
+        self._read_server.set_book(
+            self.current_book.get("source_pdf"), alignments, self.current_chapters,
+            get_language(), self.current_book.get("title", ""),
         )
-        self._reload_books()
 
-    def _update_now_label(self):
-        if self.current_chapter_idx < 0 or self.current_book is None:
+    def _realign(self, book, then=None):
+        if not os.path.exists(book.get("source_pdf") or ""):
+            QMessageBox.warning(self, tr("rebuild_readalong"), tr("pdf_not_found", path=book.get("source_pdf")))
             return
-        ch = self.current_chapters[self.current_chapter_idx]
-        state = (
-            tr("state_playing") if self.player.is_playing else tr("state_paused")
-        )
-        self.now_label.setText(
-            tr(
-                "now_playing",
-                title=self.current_book["title"],
-                chapter=ch["title"],
-                state=state,
-            )
-        )
-        playing = self.player.is_playing
-        icon_name = "pause.png" if playing else "play.png"
-        self.btn_play.setIcon(
-            QIcon(resource_path(os.path.join("assets", icon_name)))
-        )
-        self.btn_play.setText(tr("pause") if playing else tr("play"))
 
-    def closeEvent(self, event):
+        def done(result):
+            located, total = result
+            self.statusBar().showMessage(tr("realign_done", located=located, total=total), 6000)
+            if then is not None:
+                then()
+
+        self._run_task(
+            lambda p, c: realign_book(self.db, book["id"], p, c),
+            on_success=done,
+            progress_dialog_title=tr("realigning"),
+        )
+
+    def _sync_readalong(self):
+        if self._read_server is None:
+            return
+        if self.current_chapter_idx < 0 or self.current_book is None or not self._chapter_offsets:
+            self._read_server.update_state(-1, 0.0, False, self.player.rate)
+            return
+        offset = self._chapter_offsets[self.current_chapter_idx]
+        pos = self.player.position if self.player.is_loaded else self._resume_pos
+        self._read_server.update_state(
+            self.current_chapters[self.current_chapter_idx]["idx"], offset + pos,
+            self.player.is_playing, self.player.rate,
+        )
+
+    def _drain_commands(self):
+        last_seek = None
+        while self._commands:
+            cmd = self._commands.popleft()
+            if cmd[0] == "seek":
+                last_seek = cmd  # rapid clicks: only the last one wins
+            elif cmd[0] == "control":
+                action = cmd[1]
+                if action in ("toggle", "next", "prev"):
+                    self._media_command(action)
+                elif action == "back":
+                    self._jump(-JUMP_SECONDS)
+                elif action == "forward":
+                    self._jump(JUMP_SECONDS)
+        if last_seek is None or self.current_book is None:
+            return
+        _, audio_start, chapter_idx = last_seek
+        row = self._row_for_idx(chapter_idx) if chapter_idx is not None else self.current_chapter_idx
+        if row < 0:
+            return
+        target = max(0.0, audio_start - self._chapter_offsets[row])
+        self._play_chapter(row, target)
+
+    # ============================================================== export
+    def _export_book(self, book):
+        if not find_ffmpeg():
+            QMessageBox.warning(self, tr("export_m4b"), tr("ffmpeg_missing"))
+            return
+        last = str(self.settings.value("export/last_dir", "") or os.path.expanduser("~"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, tr("export_m4b"), os.path.join(last, f"{sanitize(book['title'])}.m4b"),
+            "M4B audiobook (*.m4b)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".m4b"):
+            path += ".m4b"
+        self.settings.setValue("export/last_dir", os.path.dirname(path))
+
+        def done(out):
+            if ask(self, tr("export_m4b"), tr("export_done", path=out), QMessageBox.Icon.Information):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(out)))
+
+        self._run_task(
+            lambda p, c: export_m4b(self.db, book["id"], path, p, c),
+            on_success=done,
+            progress_dialog_title=tr("exporting"),
+        )
+
+    # ============================================================ drag/drop
+    def dragEnterEvent(self, event):  # noqa: N802 - Qt API
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        if any(u.toLocalFile().lower().endswith(".pdf") for u in urls):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):  # noqa: N802 - Qt API
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile().lower().endswith(".pdf")]
+        if paths:
+            QTimer.singleShot(0, lambda: self._start_conversion(paths))
+
+    # ================================================================ misc
+    def closeEvent(self, event):  # noqa: N802 - Qt API
+        if self._is_converting():
+            if not ask(self, tr("quit"), tr("quit_while_converting")):
+                event.ignore()
+                return
+            self.worker.cancel()
+            self.worker.wait(15000)
         self._save_progress()
         self.player.stop()
+        self.preview_player.stop()
+        for task in list(self._tasks):
+            task.cancel()
+            task.wait(3000)
         if self._read_server is not None:
             self._read_server.shutdown()
+        if self._media_keys is not None:
+            self._media_keys.unregister()
         super().closeEvent(event)
 
-    # -------------------------------------------------------------- misc
     def _open_library_dir(self):
         os.makedirs(DATA_DIR, exist_ok=True)
-        os.startfile(DATA_DIR)  # noqa: S606 - opening a folder is intended
+        QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR))
 
-    def _check_updates_now(self):
-        import webbrowser
+    def _open_logs(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_DIR))
 
-        try:
-            latest = check_for_updates()
-        except Exception:  # noqa: BLE001 - network failures are non-fatal
-            QMessageBox.information(self, tr("update_ok"), tr("update_ok"))
-            return
-        if not latest or latest == APP_VERSION:
-            QMessageBox.information(self, tr("update_ok"), tr("update_ok"))
-            return
-        box = QMessageBox(
-            QMessageBox.Icon.Question,
-            tr("update_available_title"),
-            tr("update_available_msg", version=latest),
-            parent=self,
-        )
-        open_btn = box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
-        box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
-        box.exec()
-        if box.clickedButton() is open_btn:
-            webbrowser.open("https://github.com/JuanBerta/pdf2audiobook/releases/latest")
+    def _about(self):
+        QMessageBox.about(self, tr("about"), tr("about_text", version=APP_VERSION, url=RELEASES_PAGE))
 
+    def _check_updates(self, silent=True):
+        def ok(latest):
+            if latest and is_newer(latest, APP_VERSION):
+                if ask(self, tr("update_available_title"), tr("update_available_msg", version=latest)):
+                    webbrowser.open(RELEASES_PAGE)
+            elif not silent:
+                QMessageBox.information(self, tr("check_updates"), tr("update_ok", version=APP_VERSION))
 
-class BookmarkDialog(QDialog):
-    """Modal dialog listing bookmarks; double-click to jump, Del to delete."""
+        def fail(msg):
+            logging.info("update check failed: %s", msg)
+            if not silent:
+                QMessageBox.warning(self, tr("check_updates"), tr("update_failed", error=msg))
 
-    def __init__(self, marks, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(parent.tr("bookmarks_menu"))
-        self.resize(420, 320)
-        self.chosen = None
-        self._marks = marks
-
-        layout = QVBoxLayout(self)
-        self.list_widget = QListWidget()
-        for i, mark in enumerate(marks):
-            item = QListWidgetItem(
-                f"{mark['chapter_idx'] + 1:02d}  {fmt_duration(mark['position'])}  {mark['note'] or ''}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, i)
-            self.list_widget.addItem(item)
-        self.list_widget.itemDoubleClicked.connect(self._jump)
-        self.list_widget.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self.list_widget.customContextMenuRequested.connect(self._context)
-        layout.addWidget(self.list_widget)
-
-        btn_row = QHBoxLayout()
-        btn_close = QPushButton(parent.tr("no"))
-        btn_close.clicked.connect(self.reject)
-        btn_row.addStretch(1)
-        btn_row.addWidget(btn_close)
-        layout.addLayout(btn_row)
-
-    def _jump(self, item):
-        self.chosen = (
-            self._marks[item.data(Qt.ItemDataRole.UserRole)]["chapter_idx"],
-            self._marks[item.data(Qt.ItemDataRole.UserRole)]["position"],
-        )
-        self.accept()
-
-    def _context(self, pos):
-        from PyQt6.QtWidgets import QMenu
-
-        item = self.list_widget.itemAt(pos)
-        if item is None:
-            return
-        menu = QMenu(self)
-        action = menu.addAction(self.parent().tr("delete_from_library"))
-        if menu.exec(self.list_widget.mapToGlobal(pos)) is action:
-            idx = item.data(Qt.ItemDataRole.UserRole)
-            mark = self._marks.pop(idx)
-            self.parent().db.delete_bookmark(mark["id"])
-            self.list_widget.takeItem(self.list_widget.row(item))
+        self._run_task(lambda _p, _c: check_for_updates(), on_success=ok, on_fail=fail)
 
 
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
+    if "--selftest" in sys.argv:
+        from .selftest import run
+
+        i = sys.argv.index("--selftest")
+        report = sys.argv[i + 1] if len(sys.argv) > i + 1 else os.path.join(LOG_DIR, "selftest.txt")
+        return run(report, MODELS_DIR)
     logging.basicConfig(
         filename=os.path.join(LOG_DIR, "app.log"),
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    logging.info("PDF2Audiobook %s starting", APP_VERSION)
 
     def _excepthook(exc_type, exc_value, exc_tb):
-        logging.error(
-            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb)
-        )
+        logging.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
         try:
-            QMessageBox.critical(
-                None, "PDF2Audiobook", f"Unexpected error:\n{exc_value}"
-            )
+            QMessageBox.critical(None, "PDF2Audiobook", f"{tr('unexpected_error')}\n{exc_value}")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1185,65 +1454,34 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("PDF2Audiobook")
     app.setApplicationDisplayName("PDF2Audiobook")
+    app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(QIcon(resource_path(os.path.join("assets", "icon.png"))))
+
+    settings = QSettings("PDF2Audiobook", "PDF2Audiobook")
+    stored = settings.value("ui/language", "en")
+    if stored in SUPPORTED_LANGUAGES:
+        set_language(stored)
 
     # Single-instance lock: protects the SQLite library from concurrent writes.
     os.makedirs(DATA_DIR, exist_ok=True)
     lock = QLockFile(LOCK_PATH)
     lock.setStaleLockTime(0)
     if not lock.tryLock(100):
-        QMessageBox.information(
-            None, tr("single_instance_title"), tr("single_instance_msg")
-        )
+        QMessageBox.information(None, tr("single_instance_title"), tr("single_instance_msg"))
         return 1
 
-    settings = QSettings("PDF2Audiobook", "PDF2Audiobook")
-    stored = settings.value("ui/language", "en")
-    if stored in SUPPORTED_LANGUAGES:
-        set_language(stored)
-    theme_mode = str(settings.value("ui/theme", "dark") or "dark")
-    apply_theme(app, theme_mode)
-
+    apply_theme(app, str(settings.value("ui/theme", "dark") or "dark"))
     win = MainWindow()
     win.show()
 
-    # First-run guide: warn early when no Piper voices are installed.
     if not list_voice_models(MODELS_DIR):
-        QTimer.singleShot(
-            800,
-            lambda: QMessageBox.information(
-                win, tr("model_missing_title"), tr("model_missing_msg", dir=MODELS_DIR)
-            ),
-        )
-
-    # Silent update check shortly after startup.
-    def _silent_update_check():
-        try:
-            latest = check_for_updates()
-        except Exception:  # noqa: BLE001
-            return
-        if latest and latest != APP_VERSION:
-            box = QMessageBox(
-                QMessageBox.Icon.Question,
-                tr("update_available_title"),
-                tr("update_available_msg", version=latest),
-                parent=win,
-            )
-            open_btn = box.addButton(tr("yes"), QMessageBox.ButtonRole.YesRole)
-            box.addButton(tr("no"), QMessageBox.ButtonRole.NoRole)
-            box.exec()
-            if box.clickedButton() is open_btn:
-                import webbrowser
-
-                webbrowser.open(
-                    "https://github.com/JuanBerta/pdf2audiobook/releases/latest"
-                )
-
-    QTimer.singleShot(3000, _silent_update_check)
+        QTimer.singleShot(800, win._ensure_voices)  # noqa: SLF001
+    QTimer.singleShot(3000, lambda: win._check_updates(silent=True))  # noqa: SLF001
 
     rc = app.exec()
     lock.unlock()
-    sys.exit(rc)
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
